@@ -120,6 +120,7 @@ PASS  a JSON export after leading blank space is read as JSON, not as CSV
 ...
 PASS  a zero-byte replicas export exits 2, it is not zero replicas  <-- pinned defect
 PASS  a header-only export of the wrong kind exits 2  <-- pinned defect
+PASS  a header-only replicas export is read as no replicas, not exit 2  <-- pinned defect
 ...
 PASS  a lineages export without row_count exits 2: a file that lost rows could not be told from a whole one  <-- pinned defect
 PASS  a versions export without exported_at exits 2: on an idle geodatabase every holder would look young  <-- pinned defect
@@ -395,7 +396,7 @@ pins these three classifications and the header line.
 |---|---|
 | 0 | Nothing in the exports holds the floor past the age limit. The exports do not show state locks, so this is not proof that nothing holds it (see Limits). |
 | 1 | At least one blocker. |
-| 2 | The tool could not do its job: an export could not be read or was empty, the exports disagree with each other, a flag was wrong, `--as-of` is earlier than the exports, `--report` could not be written, or the tool itself hit an error. |
+| 2 | The tool could not do its job: an export could not be read or was a zero-byte file, the exports disagree with each other, a flag was wrong, `--as-of` is earlier than the exports, `--report` could not be written, or the tool itself hit an error. A header-only CSV or a JSON `[]` is read as zero rows, not as exit 2 (see Limits). |
 
 Exit 2 is kept apart from exit 1 on purpose. A monitor that cannot read its input must never
 look like a monitor that found nothing, and it must never look like a finding either.

@@ -1734,7 +1734,8 @@ def self_test():
         code, out, _ = run(base + ["--replicas", export(
             "r2.csv", "objectid,item_type,id,name,row_count\n")])
         check(code == 1 and DETACHED in out,
-              "a header-only replicas export is read as no replicas")
+              "a header-only replicas export is read as no replicas, not "
+              "exit 2  <-- pinned defect")
         code, out, _ = run(base + ["--replicas", export("r3.json", "[]")])
         check(code == 1 and DETACHED in out,
               "and so is a JSON [] replicas export")

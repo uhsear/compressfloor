@@ -13,3 +13,4 @@ credentials*
 *token*
 .coverage
 .coverage.*
+.msg
