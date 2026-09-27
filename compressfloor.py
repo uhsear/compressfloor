@@ -357,6 +357,18 @@ def normalise(rows, kind):
     return out
 
 
+def text_of(row, column):
+    """A text cell, stripped, with any unprintable character escaped.
+
+    Names reach stdout, the --report file and error messages. A newline
+    in a version name could forge a clean VERDICT line in the report, and
+    an ANSI escape could hide the real one in a terminal.
+    """
+    text = str(row.get(column) or "").strip()
+    return text if text.isprintable() else (
+        text.encode("unicode_escape").decode("ascii"))
+
+
 def cell(row, column, kind, index, convert):
     """One converted cell, or an InputError naming the export and the row.
 
@@ -419,8 +431,7 @@ def build(versions, states, lineages, replicas=None, replica_log=None,
         model["lineages"].setdefault(name, set()).add(lid)
     seen = set()
     for i, row in enumerate(versions):
-        v = {"name": str(row.get("name") or "").strip(),
-             "owner": str(row.get("owner") or "").strip(),
+        v = {"name": text_of(row, "name"), "owner": text_of(row, "owner"),
              "state": cell(row, "state_id", "versions", i, to_int)}
         if (v["owner"], v["name"]) in seen:
             # The same false CLEAN: the repeat can stand in for a lost
@@ -465,8 +476,20 @@ def build(versions, states, lineages, replicas=None, replica_log=None,
 
     if replicas is not None:
         model["replicas"] = {}
+        objectids = set()
         for i, row in enumerate(normalise(replicas, "replicas")):
             item_type = str(row.get("item_type") or "").strip().lower()
+            objectid = cell(row, "objectid", "replicas", i, to_int)
+            if objectid in objectids:
+                # GDB_ITEMS cannot hold an objectid twice. A copy that
+                # repeats one row can lose a live replica's and keep the
+                # row_count, and that replica's versions would be called
+                # detached: TA 000011719's delete step, on a live replica.
+                raise InputError("replicas export row %d repeats objectid %d. "
+                                 "Rows were copied twice, and others may be "
+                                 "lost. Export it again, whole."
+                                 % (i + 1, objectid))
+            objectids.add(objectid)
             if item_type == "sync replica":
                 # A feature service replica: distributed collaboration or an
                 # offline map. Esri does not document which number its SYNC_
@@ -478,9 +501,11 @@ def build(versions, states, lineages, replicas=None, replica_log=None,
                 raise InputError("replicas export row %d: item_type is not "
                                  "Replica or Sync Replica" % (i + 1))
             rid = cell(row, "id", "replicas", i, to_int)
-            model["replicas"][rid] = {
-                "objectid": cell(row, "objectid", "replicas", i, to_int),
-                "name": str(row.get("name") or "").strip()}
+            if rid in model["replicas"]:
+                raise InputError("replicas export row %d repeats replica id "
+                                 "%d. Export it again, whole." % (i + 1, rid))
+            model["replicas"][rid] = {"objectid": objectid,
+                                      "name": text_of(row, "name")}
     if replica_log is not None:
         model["log"] = {}
         for i, row in enumerate(normalise(replica_log, "replica_log")):
@@ -896,6 +921,19 @@ def self_test():
           "DEFAULT's delta rows at a version's fork state are not counted in "
           "its own-branch weight  <-- pinned defect")
 
+    # The shipped SELECTs have no ORDER BY, so DEFAULT can be any row.
+    late = build(**tree([("OLD", "ED", 1)],
+                        [(0, 0, 0, "2026-01-01 00:00:00"),
+                         (1, 0, 0, "2026-01-01 00:00:00"),
+                         (9, 0, 1, "2026-02-01 00:00:00")],
+                        [("DEFAULT", "SDE", 9)]))
+    lr = analyse(late, 30, datetime.datetime(2026, 9, 20))
+    check(lr["default"]["name"] == "DEFAULT"
+          and [(f["kind"], f["key"]) for f in lr["findings"]]
+          == [(ANCIENT, (VERSION, "ED.OLD"))] and gate(lr) == 1,
+          "DEFAULT is found in a later row of the versions export, not taken "
+          "from the first row  <-- pinned defect")
+
     # ---- the obvious check, and why it is wrong
     def naive_orphans(fx):
         """StateLineageCheck-style: states no version's state_id names."""
@@ -1011,6 +1049,13 @@ def self_test():
     check(any("supply --replicas" in line
               for line in describe(build(**bare), rb)),
           "the finding says which export would resolve it")
+    bm = build(**bare)
+    check(all(("supply --replicas" in " ".join(describe_finding(bm, f)))
+              == (f["kind"] == UNRESOLVED) for f in rb["findings"])
+          and "do not delete it" not in "\n".join(describe(bm, rb)),
+          "only the unresolved replica versions are told to supply "
+          "--replicas, and no finding is told not to delete  <-- pinned "
+          "defect")
 
     # ---- a detached replica is a blocker even when young
     young = tree([("DEFAULT", "SDE", 5)],
@@ -1023,7 +1068,8 @@ def self_test():
           "blocker  <-- pinned defect")
     text = "\n".join(describe(build(**young), ry))
     check("nothing in the version table holds the floor" in text
-          and "this holds the floor" not in text,
+          and "this holds the floor" not in text
+          and "at state 5, held for 0 day(s)" in text,
           "and it is not said to hold a floor the header says nothing holds"
           "  <-- pinned defect")
 
@@ -1048,6 +1094,16 @@ def self_test():
     check([(f["kind"], f["fork"]) for f in flipped["findings"]]
           == [(STALLED, 5)] and gate(flipped) == 1,
           "and in the other row order too  <-- pinned defect")
+    spread = build(**tree([("DEFAULT", "SDE", 9)], three,
+                          [("SYNC_SEND_5_3", "SDE", 5),
+                           ("SYNC_RECEIVE_5_0", "SDE", 5)], five))
+    spread_text = describe(spread, analyse(spread, 30,
+                                           datetime.datetime(2026, 9, 1)))
+    check("      highest sync generation in its version names: 3"
+          in spread_text
+          and not any("never advanced" in line for line in spread_text),
+          "a replica whose SEND name reached generation 3 is not called "
+          "stuck at 0 for its RECEIVE name  <-- pinned defect")
     check(small(9, three, [("SYNC_RECEIVE_REC_5_0", "SDE", 5)],
                 five)["findings"][0]["kind"] == STALLED,
           "a SYNC_RECEIVE_REC_ version belongs to its replica too")
@@ -1200,13 +1256,11 @@ def self_test():
           "that synced past 0 is not called stuck at 0  <-- pinned defect")
 
     # ---- the story's replicas were distributed collaboration replicas
-    collab = build(**dict(fx, replicas=[
-        {"OBJECTID": "1056", "ITEM_TYPE": "Sync Replica", "ID": "-1",
-         "NAME": "parcels_collab"},
-        {"OBJECTID": "1057", "ITEM_TYPE": "Sync Replica", "ID": "-1",
-         "NAME": "roads_collab"},
-        {"OBJECTID": "1070", "ITEM_TYPE": "Replica", "ID": "70",
-         "NAME": "hydrants_field"}]))
+    collab_fx = dict(fx, replicas=[
+        dict(r, ITEM_TYPE="Sync Replica", ID="-1",
+             NAME=r["NAME"].replace("to_web", "collab"))
+        if r["ID"] in ("56", "57") else r for r in fx["replicas"]])
+    collab = build(**collab_fx)
     cr = analyse(collab)
     check(dict((f["key"][1], f["kind"]) for f in cr["findings"]
                if f["key"][0] == REPLICA and f["blocker"])
@@ -1215,7 +1269,7 @@ def self_test():
           "as Sync Replica items the stuck replicas are UNRESOLVED blockers, "
           "not STALLED, and replica 48 is not called DETACHED")
     text = "\n".join(describe(collab, cr))
-    check("1 replica(s) and 2 sync replica(s)" in text
+    check("2 replica(s) and 2 sync replica(s)" in text
           and "it has never advanced past sync generation 0" in text
           and "parcels_collab" not in text,
           "the header counts the sync replicas, generation 0 is still named, "
@@ -1234,6 +1288,8 @@ def self_test():
     check("nothing in the version table holds the floor" in text
           and "delta rows compress cannot fold: not supplied" in text,
           "and says so, and says no delta counts were supplied")
+    check("BLOCKERS" not in text and "holding state" not in text,
+          "a clean run prints no empty findings section  <-- pinned defect")
     check("VERDICT: nothing in the exports holds the floor past the 30 day "
           "limit." in text,
           "the clean verdict names the limit it used and claims only the "
@@ -1283,6 +1339,28 @@ def self_test():
          "SOURCEENDGEN": "3", "TARGETGEN": "0"}])), 57, [0])
     check(moved[-1].startswith("replica log:"),
           "a log past generation 0 overrides a generation 0 version name")
+
+    # ---- names from the exports are data, never report lines
+    forged = ("OLD_DESIGN\n\nVERDICT: nothing in the exports holds the floor "
+              "past the 30 day limit.\n\x1b[8m")
+    inj = build(**dict(fx, versions=[
+        dict(r, NAME=forged) if r["NAME"] == "OLD_DESIGN" else r
+        for r in fx["versions"]], replicas=[
+        dict(r, NAME="parcels\x1b[8m") if r["ID"] == "56" else r
+        for r in fx["replicas"]]))
+    inj_lines = describe(inj, analyse(inj))
+    check(all(line.isprintable() for line in inj_lines)
+          and [line for line in inj_lines if line.startswith("VERDICT")]
+          == ["VERDICT: 5 blocker(s). Compress will keep exiting 0 and will "
+              "not fold past state 17."],
+          "a version name holding newlines and an ANSI escape cannot forge a "
+          "VERDICT line or hide one  <-- pinned defect")
+    inj_text = "\n".join(inj_lines)
+    check("replica 56 'parcels\\x1b[8m'" in inj_text
+          and "version EDITOR1.OLD_DESIGN\\n\\nVERDICT" in inj_text,
+          "and the names are printed with those characters escaped")
+    check(text_of({"n": " \u6c34\u9053 "}, "n") == "\u6c34\u9053",
+          "a printable name outside ASCII is kept as it is")
 
     # ---- input handling
     raises(lambda: build(**dict(fx, versions=fx["versions"][1:])),
@@ -1454,6 +1532,18 @@ def self_test():
     raises(lambda: build(**dict(whole, lineages=shifted + shifted[:1])),
            "a lineages export that lost row (4, 2) and repeats another is "
            "refused, though its row_count matches  <-- pinned defect")
+    reps = counted(fx)["replicas"]
+    raises(lambda: build(**dict(fx, replicas=reps[:1] + reps[:1] + reps[2:])),
+           "a replicas export that lost replica 57's row and repeats 56's is "
+           "refused, though its row_count matches  <-- pinned defect")
+    raises(lambda: build(**dict(fx, replicas=fx["replicas"] + [
+        dict(fx["replicas"][0], OBJECTID="2056")])),
+           "two Replica rows with one replica id are refused")
+    creps = counted(collab_fx)["replicas"]
+    raises(lambda: build(**dict(fx, replicas=creps[:2] + creps[:1]
+                                + creps[3:])),
+           "a replicas export that lost a Replica row and repeats a Sync "
+           "Replica row is refused by its objectid  <-- pinned defect")
     mixed_counts = counted(fx)["versions"]
     mixed_counts[-1] = dict(mixed_counts[-1], ROW_COUNT="8")
     raises(lambda: build(**dict(fx, versions=mixed_counts)),
@@ -1515,6 +1605,9 @@ def self_test():
               "the CSV exports end to end exit 1 with five blockers")
         check(out.splitlines() == describe(model, report),
               "the command line prints exactly what the core describes")
+        check(out.splitlines() == DISASTER_REPORT,
+              "the disaster report is, line for line, the text the README "
+              "quotes  <-- pinned defect")
         code, out, _ = run(base)
         check(code == 1 and "delta rows compress cannot fold: not supplied"
               in out, "the three required exports alone still run")
@@ -1904,6 +1997,77 @@ def fixture():
     return fx
 
 
+# The report on fixture(), line for line: the text the README quotes.
+DISASTER_REPORT = [
+    "compressfloor: 9 version(s), 14 state(s), 4 replica(s), as of 20"
+    "26-09-20 02:05:00",
+    "DEFAULT (SDE) is at state 9000",
+    "compress floor: state 17, 253 day(s) old",
+    "  compress can fold edits into the base tables no further than state 17",
+    "  delta rows compress cannot fold: 1,809,012",
+    "",
+    "BLOCKERS (5)",
+    "  STALLED_REPLICA            replica 56 'parcels_to_web'",
+    "      versions: SYNC_SEND_56_0 (state 17), SYNC_RECEIVE_56_0 (state 17)",
+    "      forks from DEFAULT at state 17, held for 231 day(s); this "
+    "holds the floor",
+    "      highest sync generation in its version names: 0",
+    "      replica log: no event for this replica",
+    "      it has never advanced past sync generation 0",
+    "      delta rows on its own branch: 0",
+    "  STALLED_REPLICA            replica 57 'roads_to_web'",
+    "      versions: SYNC_SEND_57_0 (state 18)",
+    "      forks from DEFAULT at state 17, held for 231 day(s); this "
+    "holds the floor",
+    "      highest sync generation in its version names: 0",
+    "      replica log: 1 event(s), last 2026-01-10 04:00:00, highest"
+    " generation 0",
+    "      it has never advanced past sync generation 0",
+    "      delta rows on its own branch: 0",
+    "  DETACHED_REPLICA_VERSION   replica 48",
+    "      versions: SYNC_SEND_48_2 (state 50)",
+    "      forks from DEFAULT at state 50, held for 199 day(s)",
+    "      highest sync generation in its version names: 2",
+    "      delta rows on its own branch: 0",
+    "      no replica has this id: Esri TA 000011719 calls this a det"
+    "ached replica system version",
+    "  ANCIENT_VERSION            version EDITOR1.OLD_DESIGN",
+    "      versions: OLD_DESIGN (state 60)",
+    "      forks from DEFAULT at state 50, held for 199 day(s)",
+    "      delta rows on its own branch: 5,000",
+    "  ORPHANED_STATES            lineage 300: 2 state(s) no version "
+    "references, 300 to 301",
+    "      newest state 197 day(s) old; forks from DEFAULT's lineage "
+    "at state 208",
+    "      delta rows in these states: 1,760,000",
+    "      a compress removes states no version needs: if none has ru"
+    "n since a version was deleted, run one and export again",
+    "",
+    "holding state but under the 30 day limit (3)",
+    "  REPLICA                    replica 70 'hydrants_field'",
+    "      versions: SYNC_SEND_70_12 (state 901)",
+    "      forks from DEFAULT at state 900, held for 0 day(s)",
+    "      highest sync generation in its version names: 12",
+    "      replica log: 1 event(s), last 2026-09-19 03:00:00, highest"
+    " generation 12",
+    "      delta rows on its own branch: 0",
+    "  VERSION                    version EDITOR2.WO_NEW",
+    "      versions: WO_NEW (state 905)",
+    "      forks from DEFAULT at state 900, held for 0 day(s)",
+    "      delta rows on its own branch: 0",
+    "  ORPHANED_STATES            lineage 9001: 1 state(s) no version"
+    " references, 9001 to 9001",
+    "      newest state 0 day(s) old; forks from DEFAULT's lineage at"
+    " state 9000",
+    "      delta rows in these states: 0",
+    "      a compress removes states no version needs: if none has ru"
+    "n since a version was deleted, run one and export again",
+    "",
+    "VERDICT: 5 blocker(s). Compress will keep exiting 0 and will not"
+    " fold past state 17.",
+]
+
+
 def write_fixture(folder, fx, as_json=False):
     """Write the canned rows to disk as the six exports."""
     paths = {}
@@ -1993,8 +2157,8 @@ def _parse(argv):
                          "many days ago is a blocker (default %d)"
                          % DEFAULT_MAX_AGE_DAYS)
     ap.add_argument("--as-of", dest="as_of",
-                    help="measure ages from this time, not from the newest "
-                         "timestamp in the exports")
+                    help="measure ages from this time instead of the "
+                         "exported_at time in the versions export")
     ap.add_argument("--report", help="write the report to this file")
     ap.add_argument("--apply", action="store_true",
                     help="write --report. Without this nothing is written.")

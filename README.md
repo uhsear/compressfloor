@@ -38,6 +38,7 @@ PASS  and it carries the 1,760,000 delta rows supplied for it
 PASS  and it is reported forking from DEFAULT's lineage at state 208
 ...
 PASS  DEFAULT's delta rows at a version's fork state are not counted in its own-branch weight  <-- pinned defect
+PASS  DEFAULT is found in a later row of the versions export, not taken from the first row  <-- pinned defect
 PASS  the naive orphan count calls DEFAULT's own ancestor state 10 an orphan  <-- pinned defect
 PASS  the lineage walk finds exactly the three unreferenced states
 PASS  on a healthy tree the naive count finds an orphan and the walk finds none
@@ -50,10 +51,12 @@ PASS  a version made today from a DEFAULT idle for 80 days is not 80 days old  <
 PASS  a version made from state 0 forks at state 0 and holds the floor there  <-- pinned defect
 PASS  a lineage export without its (lineage, 0) rows gives the same report  <-- pinned defect
 ...
+PASS  only the unresolved replica versions are told to supply --replicas, and no finding is told not to delete  <-- pinned defect
 PASS  a detached replica version at DEFAULT's own state is still a blocker  <-- pinned defect
 PASS  and it is not said to hold a floor the header says nothing holds  <-- pinned defect
 PASS  a replica with a fresh SEND and an old RECEIVE forks at the older state and is STALLED
 PASS  and in the other row order too  <-- pinned defect
+PASS  a replica whose SEND name reached generation 3 is not called stuck at 0 for its RECEIVE name  <-- pinned defect
 ...
 PASS  beside a Sync Replica item, an unmatched SYNC_ version is UNRESOLVED, not DETACHED  <-- pinned defect
 PASS  and it is not sent to TA 000011719's delete step  <-- pinned defect
@@ -71,7 +74,10 @@ PASS  a blank exported_at is refused, never read as no export time  <-- pinned d
 ...
 PASS  a replica log is read at its highest generation, and a replica that synced past 0 is not called stuck at 0  <-- pinned defect
 ...
+PASS  a clean run prints no empty findings section  <-- pinned defect
 PASS  the clean verdict names the limit it used and claims only the exports  <-- pinned defect
+...
+PASS  a version name holding newlines and an ANSI escape cannot forge a VERDICT line or hide one  <-- pinned defect
 ...
 PASS  a versions export without DEFAULT is refused  <-- pinned defect
 ...
@@ -89,8 +95,13 @@ PASS  a lineages export that lost a row is refused by its row_count, not read as
 PASS  a states export that lost its last row is refused, not a clean exit 0 without the orphaned lineage  <-- pinned defect
 PASS  a versions export that lost OLD's row and repeats KEEP's is refused, though its row_count matches  <-- pinned defect
 PASS  a lineages export that lost row (4, 2) and repeats another is refused, though its row_count matches  <-- pinned defect
+PASS  a replicas export that lost replica 57's row and repeats 56's is refused, though its row_count matches  <-- pinned defect
+...
+PASS  a replicas export that lost a Replica row and repeats a Sync Replica row is refused by its objectid  <-- pinned defect
 ...
 PASS  the sqlserver replicas query sets QUOTED_IDENTIFIER ON before its XML call  <-- pinned defect
+...
+PASS  the disaster report is, line for line, the text the README quotes  <-- pinned defect
 ...
 PASS  an --as-of before the exports exits 2, not a report of negative ages  <-- pinned defect
 ...
@@ -128,10 +139,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-213 assertions, 0 failed
+224 assertions, 0 failed
 ```
 
-The full run prints all 213 assertions. The `...` lines are where this block is cut.
+The full run prints all 224 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -157,7 +168,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 213 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu (Python
+The same 224 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu (Python
 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -328,7 +339,7 @@ fixture with replicas 56 and 57 exported as `Sync Replica` items, run through th
 
 ```
 $ python compressfloor.py --versions versions.csv --states states.csv --lineages lineages.csv --replicas replicas.csv --replica-log replica_log.csv --deltas deltas.csv
-compressfloor: 9 version(s), 14 state(s), 1 replica(s) and 2 sync replica(s), as of 2026-09-20 02:05:00
+compressfloor: 9 version(s), 14 state(s), 2 replica(s) and 2 sync replica(s), as of 2026-09-20 02:05:00
 DEFAULT (SDE) is at state 9000
 compress floor: state 17, 253 day(s) old
   compress can fold edits into the base tables no further than state 17
@@ -349,14 +360,21 @@ BLOCKERS (5)
       it has never advanced past sync generation 0
       delta rows on its own branch: 0
       no geodatabase replica has this id, and 2 sync replica(s) exist, whose version ids Esri does not document. It may be one of them: do not delete it on TA 000011719's word
+  UNRESOLVED_REPLICA_VERSION replica 48
+      versions: SYNC_SEND_48_2 (state 50)
+      forks from DEFAULT at state 50, held for 199 day(s)
+      highest sync generation in its version names: 2
+      delta rows on its own branch: 0
+      no geodatabase replica has this id, and 2 sync replica(s) exist, whose version ids Esri does not document. It may be one of them: do not delete it on TA 000011719's word
 ...
 VERDICT: 5 blocker(s). Compress will keep exiting 0 and will not fold past state 17.
 ```
 
 The run still exits 1, and it still says that each replica never advanced past generation 0.
 It does not name the replicas, and it does not say whether they are stalled or detached. Replica
-48 is `UNRESOLVED_REPLICA_VERSION` too, because a `Sync Replica` item exists. The self-test pins
-these three classifications and the header line.
+48 is `UNRESOLVED_REPLICA_VERSION` too, because a `Sync Replica` item exists. Replicas 70 and 99
+are still `Replica` items, so the header counts 2 replicas and 2 sync replicas. The self-test
+pins these three classifications and the header line.
 
 ## Exit codes
 
@@ -379,6 +397,8 @@ run with exit 2:
 - a state that appears twice in the states export, a version (owner and name) that appears
   twice in the versions export, or a lineage and state pair that appears twice in the lineages
   export
+- an `objectid` that appears twice in the replicas export, or a replica `id` that two `Replica`
+  rows share
 - a versions export file without an `exported_at` column, or with an `exported_at` that is blank
   or differs between rows
 - an `exported_at` time earlier than the newest timestamp in the exports
@@ -403,10 +423,12 @@ therefore returns `COUNT(*) OVER () AS row_count`, the number of rows that the q
 on each row.
 
 A paged copy can also repeat one row and lose another, and the count then stays right. None of
-the state, version and lineage tables can hold one key twice, so a repeated key in those exports
-exits 2. The self-test pins a lost-and-repeated versions export and a lost-and-repeated lineages
-export. The deltas and replica log exports can repeat rows legitimately, so they are not checked
-this way.
+the state, version, lineage and replica item tables can hold one key twice, so a repeated key in
+those exports exits 2. In the replicas export the key is the item `objectid`, and for a
+`Replica` item also its `id`. A lost `Replica` row is the dangerous case: its live replica's
+system versions would be reported as detached, and TA 000011719 would send you to delete them.
+The self-test pins a lost-and-repeated export for versions, lineages and replicas. The deltas
+and replica log exports can repeat rows legitimately, so they are not checked this way.
 
 ## The SQL
 
@@ -613,26 +635,26 @@ The article warns that the replica query in Oracle needs EXTPROC configured.
 
 All three dialects were run, exactly as printed by `--sql`, against a synthetic schema in a
 throwaway container: PostgreSQL 16 with `psql`, SQL Server 2022 with `sqlcmd` and Oracle
-Database Free with SQL\*Plus. Each query was saved in its own file and run with the procedure in
-the tables above, and nothing else was done to the output. Each schema used the table and
-column names above. It was filled with the self-test's fixture, including 1.8 million real
-delta rows across two versioned tables, plus one `Sync Replica` item with a `<GPSyncReplica>`
-definition whose `ID` is `-1`. For each DBMS, the tool's report on the exported CSVs was
-identical, line for line, to its report on the same rows written directly as CSV. That report
-is the one above, except that replica 48 is `UNRESOLVED_REPLICA_VERSION`, because a `Sync
-Replica` item exists. Each export carried its `row_count`. When the last row of a live lineages
-export was deleted, the run exited 2 on all three DBMSs.
+Database Free with SQL\*Plus. The last run used the current `--sql` text, with `exported_at`,
+and the current tool. Each query was saved in its own file and run with the procedure in the
+tables above, and nothing else was done to the output. Each schema used the table and column
+names above. It was filled with the self-test's fixture, including 1.8 million real delta rows
+across two versioned tables. It also held one `Sync Replica` item with a `<GPSyncReplica>`
+definition whose `ID` is `-1`.
+
+On each DBMS, every row of the versions export held the same `exported_at`, the container's
+clock, and the tool exited 1. Its ages were measured from that clock. The run was then repeated
+with `--as-of 2026-09-20 02:05:00`, the fixture's own export time. For each DBMS that report was
+identical, line for line, to the tool's report on the same rows written directly as CSV. That
+report is the first one above, with two differences, both caused by the `Sync Replica` item.
+The header counts `4 replica(s) and 1 sync replica(s)`, and replica 48 is
+`UNRESOLVED_REPLICA_VERSION`. Each export carried its `row_count`. When the last row of a live
+lineages export was deleted, the run exited 2 on all three DBMSs.
 
 The first live run found one defect. `sqlcmd` refused the replica query with Msg 1934, because `sqlcmd`
 connects with `QUOTED_IDENTIFIER` off and SQL Server refuses an XML `.value()` call under that
 setting. The query now sets `QUOTED_IDENTIFIER ON`, and an assertion pins it. Microsoft documents
 that SQL Server Management Studio connects with the setting on. SSMS was not part of the test.
-
-The `exported_at` column in the versions query was added after that test. The PostgreSQL form
-was then run with `psql --csv` in a throwaway PostgreSQL 16 container. It returned the same
-`exported_at` value on every row. The SQL Server form (`CURRENT_TIMESTAMP`) and the Oracle form
-(`SYSDATE`) have not been run. Each uses the same conversion as the tested `creation_time`
-column beside it.
 
 These were synthetic schemas, not geodatabases that ArcGIS created. See Limits.
 
@@ -741,12 +763,20 @@ that has not synced for months holds the floor exactly as hard as a detached one
   names the export, row and column of a cell it cannot read, but never prints the cell's value.
   The self-test passes a synthetic `.env` line and a synthetic JSON value and checks that
   neither reaches stderr.
+- **Names are printed escaped.** Version, owner and replica names come from the exports. If a
+  name holds a character that cannot be printed, such as a newline or an ANSI escape, the whole
+  name is printed with Python's `unicode_escape`, for example `\n` and `\x1b`. A name
+  therefore cannot add a false `VERDICT` line to the report, or hide the real one in a
+  terminal. The self-test pins this case.
 
 ## Sources
 
-- [Esri Technical Article 000011719](https://support.esri.com/en/technical-article/000011719),
-  "How To: Determine if there are detached replica system versions in the geodatabase". The
-  article is archived; the 2021 copy on the Wayback Machine is the one read here.
+- Esri Technical Article 000011719, "How To: Determine if there are detached replica system
+  versions in the geodatabase". Its address, https://support.esri.com/en/technical-article/000011719,
+  now leads to Esri's archive page. The copy read here is the
+  [Wayback Machine copy of 5 August 2021](https://web.archive.org/web/20210805015432/https://support.esri.com/en/technical-article/000011719).
+  It holds the version names, the replica SQL for each DBMS and the warning against deleting
+  any other replica system version.
 - [Esri Technical Article 000010761](https://support.esri.com/en-us/knowledge-base/how-to-discover-what-state-locks-are-blocking-the-compr-000010761),
   "How To: Discover what state_locks are blocking the compress operation on Oracle": a
   connection takes a state lock, and compress cannot compress a locked state.
