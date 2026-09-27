@@ -83,6 +83,10 @@ PASS  a versions export without DEFAULT is refused  <-- pinned defect
 ...
 PASS  a number past a float's range is a ValueError, not an OverflowError  <-- pinned defect
 ...
+PASS  a 12-hour timestamp is refused, not read as 03:00 AM  <-- pinned defect
+PASS  any other text after the seconds is refused  <-- pinned defect
+PASS  a versions export with a 12-hour exported_at is refused, not a clock 12 hours early  <-- pinned defect
+...
 PASS  a state exported twice is refused, with the young row first  <-- pinned defect
 PASS  a state exported twice is refused, with the old row first  <-- pinned defect
 PASS  a negative state id (-1) is refused, not wrapped to the lineage's last id  <-- pinned defect
@@ -98,6 +102,8 @@ PASS  a lineages export that lost row (4, 2) and repeats another is refused, tho
 PASS  a replicas export that lost replica 57's row and repeats 56's is refused, though its row_count matches  <-- pinned defect
 ...
 PASS  a replicas export that lost a Replica row and repeats a Sync Replica row is refused by its objectid  <-- pinned defect
+...
+PASS  a deltas export with one row more than its row_count is refused, not summed twice  <-- pinned defect
 ...
 PASS  the sqlserver replicas query sets QUOTED_IDENTIFIER ON before its XML call  <-- pinned defect
 ...
@@ -133,16 +139,22 @@ PASS  a cell that is not a number is named, not echoed  <-- pinned defect
 ...
 PASS  --report without --apply writes nothing  <-- pinned defect
 ...
+PASS  --self-test takes no other flag
+PASS  --self-test --max-age-days 5 exits 2, not ignored  <-- pinned defect
+PASS  --self-test --max-age-days 30 exits 2, not ignored  <-- pinned defect
+PASS  --self-test --as-of junk exits 2, not ignored  <-- pinned defect
+PASS  --sql --as-of exits 2, not ignored  <-- pinned defect
+...
 PASS  check() and raises() really do record a failure  <-- pinned defect
 PASS  outcome() turns a crash into a value a check can fail on
 PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-224 assertions, 0 failed
+232 assertions, 0 failed
 ```
 
-The full run prints all 224 assertions. The `...` lines are where this block is cut.
+The full run prints all 232 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -151,9 +163,10 @@ The full run prints all 224 assertions. The `...` lines are where this block is 
   system versions, gives the SQL that lists the registered replicas, and tells you to compare the
   two lists by eye. It is correct, and it covers one of the four things that hold a floor.
 - **`StateLineageCheck.py` in [phillegard/ArcGIS_Maintenance](https://github.com/phillegard/ArcGIS_Maintenance)**.
-  It counts the rows in the state and lineage tables through `arcpy` and compares the counts with
-  warning and critical thresholds. A growing state count is a real early signal, and the script
-  is easy to schedule.
+  It counts the rows in the state table through `arcpy` and compares that count with warning and
+  critical thresholds. It also prints the lineage row count and an "Orphaned States" count. A
+  growing state count is a real early signal, and the script is easy to schedule. Its orphaned
+  state count uses the query that "Why the obvious version is wrong" shows to be misleading.
 
 Neither says which version or replica holds the floor, and neither runs without a live
 connection. For geodatabase replicas, this tool does the comparison that the article describes.
@@ -168,7 +181,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 224 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu (Python
+The same 232 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu (Python
 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -204,10 +217,10 @@ python compressfloor.py ... --report floor.txt --apply
 | `--replica-log` | off | The replica log export. Needs `--replicas`, because the log names a replica by its item `objectid`. |
 | `--deltas` | off | Delta rows per state. Without it, every weight prints as `not supplied`. |
 | `--max-age-days` | `30` | A holder that DEFAULT moved past more than this many days ago is a blocker. `0` makes a blocker of every holder and orphaned lineage older than the as-of time itself. |
-| `--as-of` | the export time | Measure ages from this time instead of the `exported_at` time in the versions export. `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`. A time earlier than the newest timestamp in the exports exits 2, because every age would be negative. |
+| `--as-of` | the export time | Measure ages from this time instead of the `exported_at` time in the versions export. `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`, 24-hour. A time earlier than the newest timestamp in the exports exits 2, because every age would be negative. |
 | `--report` | off | Write the report to this file. Needs `--apply`. |
 | `--apply` | off | Write `--report`. Without it nothing is written. |
-| `--sql` | off | Print the SELECTs for `sqlserver`, `postgresql` or `oracle`, and exit. |
+| `--sql` | off | Print the SELECTs for `sqlserver`, `postgresql` or `oracle`, and exit. Takes no other flag. |
 | `--self-test` | off | Run the assertions and exit. Takes no other flag. |
 
 A file whose first non-blank character is `[` or `{` is read as JSON, and it must be an array
@@ -668,7 +681,8 @@ before it crosses any threshold that a busy geodatabase would tolerate. When it 
 it says that there are too many states, not which version keeps them.
 
 **Counting states that no version points at is wrong.** The tempting query is "the states whose
-`state_id` is not any version's `state_id`":
+`state_id` is not any version's `state_id`". `StateLineageCheck.py` reports this count as
+"Orphaned States":
 
 ```sql
 SELECT COUNT(*) FROM sde.SDE_states s
@@ -734,8 +748,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
   until that device has removed the map and the version is reconciled and posted.
 - **Delta counts come from `SDE_mvtables_modified`.** Step 1 of the delta SQL lists only the
   tables that have a row there. A table with delta rows but no such row is not counted.
-- **One clock.** A time zone suffix on a timestamp is ignored, because every timestamp comes from
-  one database. Fractional seconds are dropped. The PostgreSQL versions query reads
+- **One clock.** A `Z` or `+hh:mm` zone on a timestamp is ignored, because every timestamp comes
+  from one database. Fractional seconds are dropped. Any other text after the seconds, such as a
+  12-hour `PM`, exits 2. The PostgreSQL versions query reads
   `LOCALTIMESTAMP`, the time in the session's time zone. If that zone differs from the one the
   states were written in, every age shifts by the difference. An `exported_at` that is earlier
   than the newest state exits 2.
@@ -775,8 +790,8 @@ that has not synced for months holds the floor exactly as hard as a detached one
   versions in the geodatabase". Its address, https://support.esri.com/en/technical-article/000011719,
   now leads to Esri's archive page. The copy read here is the
   [Wayback Machine copy of 5 August 2021](https://web.archive.org/web/20210805015432/https://support.esri.com/en/technical-article/000011719).
-  It holds the version names, the replica SQL for each DBMS and the warning against deleting
-  any other replica system version.
+  It holds the version names, the replica SQL for SQL Server and Oracle and the warning against
+  deleting any other replica system version.
 - [Esri Technical Article 000010761](https://support.esri.com/en-us/knowledge-base/how-to-discover-what-state-locks-are-blocking-the-compr-000010761),
   "How To: Discover what state_locks are blocking the compress operation on Oracle": a
   connection takes a state lock, and compress cannot compress a locked state.

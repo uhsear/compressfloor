@@ -260,20 +260,32 @@ class InputError(Exception):
 
 # --------------------------------------------------------------- decision core
 
+# A date, then optionally the time, a fraction and a zone. Nothing else.
+TIME_RE = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})"
+                     r"(?:[ T]([0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.[0-9]+)?"
+                     r"(?:Z|[+-][0-9]{2}(?::?[0-9]{2})?)?)?\Z")
+
+
 def parse_time(text):
     """A timestamp from an export, or None for a blank cell.
 
     The shipped SQL formats every date as YYYY-MM-DD HH:MM:SS. A T separator,
     fractional seconds and a bare date are accepted too, because that is what
-    a JSON export or a spreadsheet round trip produces. A time zone suffix is
-    ignored: every timestamp comes from the one database clock.
+    a JSON export or a spreadsheet round trip produces. A Z or +hh[:mm] zone
+    is ignored: every timestamp comes from the one database clock. Any other
+    suffix raises ValueError. "03:00:00 PM" read as 03:00 moves a clock 12
+    hours and can turn a blocker into a clean exit 0.
     """
-    t = str(text).strip().replace("T", " ")
+    t = str(text).strip()
     if not t:
         return None
-    if len(t) == 10:
-        return datetime.datetime.strptime(t, "%Y-%m-%d")
-    return datetime.datetime.strptime(t[:19], "%Y-%m-%d %H:%M:%S")
+    m = TIME_RE.match(t)
+    if not m:
+        raise ValueError("not a YYYY-MM-DD HH:MM:SS timestamp")
+    if m.group(2) is None:
+        return datetime.datetime.strptime(m.group(1), "%Y-%m-%d")
+    return datetime.datetime.strptime("%s %s" % m.groups(),
+                                      "%Y-%m-%d %H:%M:%S")
 
 
 def to_int(value):
@@ -1408,6 +1420,18 @@ def self_test():
     check(parse_time("2026-01-02") == datetime.datetime(2026, 1, 2),
           "a bare date parses")
     check(parse_time("  ") is None, "a blank timestamp is None")
+    check(parse_time("2026-01-02 03:04:05+05:30") == parse_time(
+        "2026-01-02 03:04:05-0530") == parse_time("2026-01-02 03:04:05+05")
+          == datetime.datetime(2026, 1, 2, 3, 4, 5),
+          "a +hh:mm, -hhmm or +hh zone is ignored")
+    raises(lambda: parse_time("2026-09-20 03:00:00 PM"), "a 12-hour "
+           "timestamp is refused, not read as 03:00 AM  <-- pinned defect",
+           ValueError)
+    raises(lambda: parse_time("2026-09-20 02:05:00 garbage"), "any other "
+           "text after the seconds is refused  <-- pinned defect", ValueError)
+    raises(lambda: build(**stamped(fx, "2026-09-20 03:00:00 PM")),
+           "a versions export with a 12-hour exported_at is refused, not a "
+           "clock 12 hours early  <-- pinned defect")
     summed = build(**dict(fx, deltas=[{"state_id": "301", "delta_rows": "5"},
                                       {"state_id": "301", "delta_rows": 7}]))
     check(summed["deltas"][301] == 12,
@@ -1548,9 +1572,12 @@ def self_test():
     mixed_counts[-1] = dict(mixed_counts[-1], ROW_COUNT="8")
     raises(lambda: build(**dict(fx, versions=mixed_counts)),
            "an export whose rows disagree on row_count is refused")
-    pasted = counted(fx)["versions"]
-    raises(lambda: build(**dict(fx, versions=pasted + pasted[-1:])),
-           "an export with more rows than its row_count is refused")
+    # The deltas export has no duplicate-key check: a repeated row is
+    # summed. Only row_count can refuse a copy with one row too many.
+    pasted = counted(fx)["deltas"]
+    raises(lambda: build(**dict(fx, deltas=pasted + pasted[-1:])),
+           "a deltas export with one row more than its row_count is refused, "
+           "not summed twice  <-- pinned defect")
 
     # ---- the SQL the README tells the user to run
     for dbms in ("sqlserver", "postgresql", "oracle"):
@@ -1835,6 +1862,15 @@ def self_test():
         code, _, err = run(["--self-test", "--versions", "x"])
         check(code == 2 and "--self-test takes no other flag" in err,
               "--self-test takes no other flag")
+        for extra in (["--max-age-days", "5"], ["--max-age-days", "30"],
+                      ["--as-of", "junk"]):
+            code, _, err = run(["--self-test"] + extra)
+            check(code == 2 and "--self-test takes no other flag" in err,
+                  "--self-test %s exits 2, not ignored  <-- pinned defect"
+                  % " ".join(extra))
+        code, _, err = run(["--sql", "oracle", "--as-of", "2026-01-01"])
+        check(code == 2 and "--sql takes no other flag" in err,
+              "--sql --as-of exits 2, not ignored  <-- pinned defect")
 
         argv_before = sys.argv
         sys.argv = ["compressfloor.py", "--sql", "sqlserver"]
@@ -2151,8 +2187,9 @@ def _parse(argv):
                     help="the replica log export (optional, needs "
                          "--replicas)")
     ap.add_argument("--deltas", help="delta rows per state (optional)")
+    # No argparse default: None tells "not given" from "--max-age-days 30",
+    # so --self-test and --sql can refuse it. _main() applies the default.
     ap.add_argument("--max-age-days", dest="max_age_days", type=int,
-                    default=DEFAULT_MAX_AGE_DAYS,
                     help="a holder that DEFAULT moved past more than this "
                          "many days ago is a blocker (default %d)"
                          % DEFAULT_MAX_AGE_DAYS)
@@ -2192,14 +2229,16 @@ def main(argv=None):
 def _main(args):
     exports = ("versions", "states", "lineages", "replicas", "replica_log",
                "deltas")
-    given = [k for k in exports if getattr(args, k)]
+    # Every flag but --self-test and --sql. An ignored flag reads as obeyed.
+    others = [k for k in exports + ("report", "as_of", "max_age_days")
+              if getattr(args, k) is not None] + ["apply"] * args.apply
 
     if args.self_test:
-        if given or args.sql or args.report or args.apply:
+        if others or args.sql:
             return fail("--self-test takes no other flag.")
         return self_test()
     if args.sql:
-        if given or args.report or args.apply:
+        if others:
             return fail("--sql takes no other flag.")
         sys.stdout.write(SQL[args.sql])
         return 0
@@ -2211,6 +2250,8 @@ def _main(args):
     if args.replica_log and not args.replicas:
         return fail("--replica-log needs --replicas: the log names replicas "
                     "by item objectid, and only that export maps it.")
+    if args.max_age_days is None:
+        args.max_age_days = DEFAULT_MAX_AGE_DAYS
     if args.max_age_days < 0:
         return fail("--max-age-days cannot be negative.")
     if args.max_age_days > datetime.timedelta.max.days:
