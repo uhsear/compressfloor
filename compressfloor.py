@@ -91,10 +91,17 @@ REQUIRED = {
 # and a lost lineage or state row can turn a blocker into a clean exit 0.
 ROW_COUNT = "row_count"
 
+# The shipped versions SELECT also returns the database clock under this
+# name. It is the default as-of time. Without it, ages would be measured
+# from the newest state or replica log event, and on a geodatabase where
+# editing has stopped every holder would look young for ever: a stalled
+# replica would never cross the limit, and a nightly run would exit 0.
+EXPORTED_AT = "exported_at"
+
 # The only header names an error message may echo. A wrong file passed by
 # mistake, such as a .env or a .pgpass, must never be printed to a job log.
 KNOWN_COLUMNS = set(c for columns in REQUIRED.values() for c in columns)
-KNOWN_COLUMNS.add(ROW_COUNT)
+KNOWN_COLUMNS.update((ROW_COUNT, EXPORTED_AT))
 
 # The read-only SELECTs that produce each export, per DBMS. Table and column
 # names are from Esri's geodatabase system table documentation; the GPReplica
@@ -104,7 +111,9 @@ KNOWN_COLUMNS.add(ROW_COUNT)
 SQL = {
     "sqlserver": """\
 -- versions.csv
-SELECT name, owner, state_id, COUNT(*) OVER () AS row_count
+SELECT name, owner, state_id,
+       CONVERT(varchar(19), CURRENT_TIMESTAMP, 120) AS exported_at,
+       COUNT(*) OVER () AS row_count
 FROM sde.SDE_versions;
 
 -- states.csv
@@ -150,7 +159,9 @@ SELECT NULL AS state_id, 0 AS delta_rows WHERE 1 = 0
 """,
     "postgresql": """\
 -- versions.csv
-SELECT name, owner, state_id, COUNT(*) OVER () AS row_count
+SELECT name, owner, state_id,
+       to_char(LOCALTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS') AS exported_at,
+       COUNT(*) OVER () AS row_count
 FROM sde.sde_versions;
 
 -- states.csv
@@ -195,7 +206,9 @@ SELECT NULL::bigint AS state_id, 0::bigint AS delta_rows WHERE 1 = 0
 """,
     "oracle": """\
 -- versions.csv
-SELECT name, owner, state_id, COUNT(*) OVER () AS row_count
+SELECT name, owner, state_id,
+       TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') AS exported_at,
+       COUNT(*) OVER () AS row_count
 FROM sde.VERSIONS;
 
 -- states.csv
@@ -297,11 +310,13 @@ def fold(kind, header):
 def check_columns(kind, header, counted=False):
     """Raise unless a header holds every column this export needs.
 
-    counted also requires row_count. An export file must carry it; rows
-    handed to build() by another script need not.
+    counted also requires row_count, and exported_at in the versions
+    export. An export file must carry them; rows handed to build() by
+    another script need not.
     """
     header = set(fold(kind, header))
-    needed = REQUIRED[kind] + ((ROW_COUNT,) if counted else ())
+    needed = REQUIRED[kind] + ((ROW_COUNT,) if counted else ()) + (
+        (EXPORTED_AT,) if counted and kind == "versions" else ())
     absent = [c for c in needed if c not in header]
     if absent:
         # Echo only column names the tool knows. Anything else may be the
@@ -371,7 +386,8 @@ def build(versions, states, lineages, replicas=None, replica_log=None,
     lineages = normalise(lineages, "lineages")
 
     model = {"versions": [], "states": {}, "lineages": {}, "replicas": None,
-             "sync_replicas": 0, "log": None, "deltas": None}
+             "sync_replicas": 0, "log": None, "deltas": None,
+             "exported_at": None}
     for i, row in enumerate(states):
         sid = cell(row, "state_id", "states", i, to_int)
         if sid in model["states"]:
@@ -393,11 +409,27 @@ def build(versions, states, lineages, replicas=None, replica_log=None,
         if name < 0 or lid < 0:
             raise InputError("lineages export row %d holds a negative id"
                              % (i + 1))
+        if lid in model["lineages"].get(name, ()):
+            # The table cannot hold a pair twice. A copy that repeats one
+            # row can lose another and keep the row_count: a false CLEAN.
+            raise InputError("lineages export row %d repeats lineage %d, "
+                             "state %d. Rows were copied twice, and others "
+                             "may be lost. Export it again, whole."
+                             % (i + 1, name, lid))
         model["lineages"].setdefault(name, set()).add(lid)
+    seen = set()
     for i, row in enumerate(versions):
         v = {"name": str(row.get("name") or "").strip(),
              "owner": str(row.get("owner") or "").strip(),
              "state": cell(row, "state_id", "versions", i, to_int)}
+        if (v["owner"], v["name"]) in seen:
+            # The same false CLEAN: the repeat can stand in for a lost
+            # holder's row.
+            raise InputError("versions export row %d repeats version %s.%s. "
+                             "Rows were copied twice, and others may be "
+                             "lost. Export it again, whole."
+                             % (i + 1, v["owner"], v["name"]))
+        seen.add((v["owner"], v["name"]))
         if v["state"] not in model["states"]:
             raise InputError(
                 "version %s.%s points at state %d, which the states export "
@@ -409,6 +441,14 @@ def build(versions, states, lineages, replicas=None, replica_log=None,
     if len(defaults) != 1:
         raise InputError("the versions export holds %d DEFAULT row(s), not 1. "
                          "Is it the version table?" % len(defaults))
+    if EXPORTED_AT in versions[0]:
+        stamps = set(str(row.get(EXPORTED_AT)).strip() for row in versions)
+        model["exported_at"] = cell(versions[0], EXPORTED_AT, "versions", 0,
+                                    parse_time)
+        if len(stamps) != 1 or model["exported_at"] is None:
+            raise InputError("the versions export's exported_at is blank or "
+                             "differs between rows. It is one clock reading "
+                             "per export. Export it again.")
     if 0 not in model["states"]:
         raise InputError("the states export has no state 0, so it is not the "
                          "whole state table")
@@ -516,10 +556,11 @@ def age_of(model, state_id, as_of):
 
 
 def latest_time(model):
-    """The newest timestamp in the exports: the as-of time by default.
+    """The newest timestamp in the exports.
 
-    Measuring age from the exports rather than the local clock makes a run
-    repeatable, and means an export read a week later reports the same ages.
+    No age may be measured from before it. It is the as-of time only for
+    rows with no exported_at, handed to build() by another script: on an
+    idle geodatabase it makes every holder look young.
     """
     times = [s["created"] for s in model["states"].values() if s["created"]]
     for rows in (model["log"] or {}).values():
@@ -538,7 +579,9 @@ def subject_of(version):
 def analyse(model, max_age_days=DEFAULT_MAX_AGE_DAYS, as_of=None):
     """The floor, what holds it, and which holders are blockers."""
     newest = latest_time(model)
-    as_of = as_of or newest
+    # The export's own clock, not the local one: the same exports give the
+    # same report on any day.
+    as_of = as_of or model["exported_at"] or newest
     if as_of < newest:
         # Every age would be measured from before the state it ages, and a
         # negative age is never over the limit: a false CLEAN.
@@ -669,9 +712,15 @@ def describe(model, report):
     """The report as lines of text: stdout and the --report file."""
     nv, ns, nr = report["counts"]
     d = report["default"]
+    if nr is None:
+        replicas = "replicas not supplied"
+    elif model["sync_replicas"]:
+        replicas = "%d replica(s) and %d sync replica(s)" % (
+            nr, model["sync_replicas"])
+    else:
+        replicas = "%d replica(s)" % nr
     out = ["compressfloor: %d version(s), %d state(s), %s, as of %s"
-           % (nv, ns, "replicas not supplied" if nr is None
-              else "%d replica(s)" % nr, report["as_of"]),
+           % (nv, ns, replicas, report["as_of"]),
            "DEFAULT (%s) is at state %d" % (d["owner"], d["state"]),
            "compress floor: state %d, %s"
            % (report["floor"], days(report["floor_age"]))]
@@ -789,9 +838,9 @@ def self_test():
     check(report["floor"] == 17,
           "the floor is state 17, where the oldest holder forks from DEFAULT")
     check(report["default"]["state"] == 9000, "DEFAULT is read at state 9000")
-    check(report["as_of"] == datetime.datetime(2026, 9, 20, 2, 0, 0),
-          "the as-of time is the newest timestamp in the exports, not the "
-          "local clock")
+    check(report["as_of"] == datetime.datetime(2026, 9, 20, 2, 5, 0),
+          "the as-of time is the database clock the versions export "
+          "recorded, not the local clock")
     check(by[(REPLICA, 56)]["kind"] == STALLED,
           "a registered replica forking at an old state is STALLED"
           "  <-- pinned defect")
@@ -1096,11 +1145,46 @@ def self_test():
         {"STATE_ID": "17", "DELTA_ROWS": "100"}])))["unfoldable"] == 1809012,
           "delta rows on the floor state itself fold, so they are not "
           "counted as unfoldable")
-    check(analyse(build(**dict(fx, replica_log=fx["replica_log"] + [
-        {"REPLICAID": "1070", "LOGDATE": "2026-09-21 00:00:00",
-         "SOURCEENDGEN": "13", "TARGETGEN": "12"}])))["as_of"]
+    later = [{"REPLICAID": "1070", "LOGDATE": "2026-09-21 00:00:00",
+              "SOURCEENDGEN": "13", "TARGETGEN": "12"}]
+    unstamped = dict(fx, versions=[dict((k, v) for k, v in r.items()
+                                        if k != "EXPORTED_AT")
+                                   for r in fx["versions"]])
+    check(analyse(build(**dict(unstamped, replica_log=fx["replica_log"]
+                               + later)))["as_of"]
           == datetime.datetime(2026, 9, 21),
-          "a replica log event newer than every state moves the as-of time")
+          "rows with no export time are aged from their newest timestamp, "
+          "a replica log event included")
+    raises(lambda: analyse(build(**dict(fx, replica_log=fx["replica_log"]
+                                        + later))),
+           "a replica log event after the export time is refused: the clocks "
+           "disagree")
+
+    # ---- a geodatabase where editing stopped
+    # DEFAULT moved past replica 56's fork on 1 January, and nothing was
+    # edited after 20 January. The exports were taken on 27 September.
+    idle_gdb = tree([("DEFAULT", "SDE", 30)],
+                    [(0, 0, 0, "2025-06-01 00:00:00"),
+                     (17, 0, 0, "2025-12-01 00:00:00"),
+                     (18, 0, 17, "2026-01-01 00:00:00"),
+                     (30, 0, 18, "2026-01-20 00:00:00")],
+                    [("SYNC_SEND_56_0", "SDE", 17)])
+    check(gate(analyse(build(**idle_gdb))) == 0,
+          "without an export time, a replica stalled since January looks 19 "
+          "days old on a geodatabase idle since then")
+    idle_at = analyse(build(**stamped(idle_gdb, "2026-09-27 00:00:00")))
+    check(gate(idle_at) == 1 and idle_at["findings"][0]["age"].days == 269,
+          "with the export time, the same replica has held the floor for 269 "
+          "days and is a blocker  <-- pinned defect")
+    raises(lambda: build(**stamped(idle_gdb, "")),
+           "a blank exported_at is refused, never read as no export time  "
+           "<-- pinned defect")
+    raises(lambda: build(**dict(idle_gdb, versions=[
+        dict(r, EXPORTED_AT="2026-09-%02d 00:00:00" % (20 + i))
+        for i, r in enumerate(idle_gdb["versions"])])),
+           "versions rows that disagree on exported_at are refused")
+    raises(lambda: analyse(build(**stamped(idle_gdb, "2026-01-19 00:00:00"))),
+           "an export time before the newest state is refused")
     check("highest generation 4" in replica_evidence(build(**dict(
         fx, replica_log=[{"REPLICAID": "1057", "LOGDATE": "2026-01-10",
                           "SOURCEENDGEN": "0", "TARGETGEN": "4"}])), 57, [0])[1],
@@ -1114,6 +1198,28 @@ def self_test():
                       "highest generation 5"],
           "a replica log is read at its highest generation, and a replica "
           "that synced past 0 is not called stuck at 0  <-- pinned defect")
+
+    # ---- the story's replicas were distributed collaboration replicas
+    collab = build(**dict(fx, replicas=[
+        {"OBJECTID": "1056", "ITEM_TYPE": "Sync Replica", "ID": "-1",
+         "NAME": "parcels_collab"},
+        {"OBJECTID": "1057", "ITEM_TYPE": "Sync Replica", "ID": "-1",
+         "NAME": "roads_collab"},
+        {"OBJECTID": "1070", "ITEM_TYPE": "Replica", "ID": "70",
+         "NAME": "hydrants_field"}]))
+    cr = analyse(collab)
+    check(dict((f["key"][1], f["kind"]) for f in cr["findings"]
+               if f["key"][0] == REPLICA and f["blocker"])
+          == {56: UNRESOLVED, 57: UNRESOLVED, 48: UNRESOLVED}
+          and gate(cr) == 1,
+          "as Sync Replica items the stuck replicas are UNRESOLVED blockers, "
+          "not STALLED, and replica 48 is not called DETACHED")
+    text = "\n".join(describe(collab, cr))
+    check("1 replica(s) and 2 sync replica(s)" in text
+          and "it has never advanced past sync generation 0" in text
+          and "parcels_collab" not in text,
+          "the header counts the sync replicas, generation 0 is still named, "
+          "and no collaboration replica name is guessed")
 
     # ---- a clean geodatabase
     clean = analyse(build(**tree([("DEFAULT", "SDE", 5)],
@@ -1143,7 +1249,7 @@ def self_test():
     lines = describe(model, report)
     joined = "\n".join(lines)
     check(lines[0].startswith("compressfloor: 9 version(s), 14 state(s), "
-                              "4 replica(s), as of 2026-09-20 02:00:00"),
+                              "4 replica(s), as of 2026-09-20 02:05:00"),
           "the header counts versions, states and replicas")
     check("compress can fold edits into the base tables no further than "
           "state 17" in joined, "the report names the floor state")
@@ -1181,8 +1287,8 @@ def self_test():
     # ---- input handling
     raises(lambda: build(**dict(fx, versions=fx["versions"][1:])),
            "a versions export without DEFAULT is refused  <-- pinned defect")
-    raises(lambda: build(**dict(fx, versions=fx["versions"]
-                                + fx["versions"][:1])),
+    raises(lambda: build(**dict(fx, versions=fx["versions"] + [
+        dict(fx["versions"][0], OWNER="EDITOR9")])),
            "two DEFAULT rows are refused")
     raises(lambda: build(**dict(fx, states=[
         r for r in fx["states"] if r["STATE_ID"] != "60"])),
@@ -1339,6 +1445,15 @@ def self_test():
     raises(lambda: build(**dict(orphan7, states=orphan7["states"][:-1])),
            "a states export that lost its last row is refused, not a clean "
            "exit 0 without the orphaned lineage  <-- pinned defect")
+    # A paged copy that repeats one row and loses another keeps its count.
+    keep_only = [r for r in whole["versions"] if r["NAME"] != "OLD"]
+    raises(lambda: build(**dict(whole, versions=keep_only + keep_only[-1:])),
+           "a versions export that lost OLD's row and repeats KEEP's is "
+           "refused, though its row_count matches  <-- pinned defect")
+    shifted = lose_4_2(whole["lineages"])
+    raises(lambda: build(**dict(whole, lineages=shifted + shifted[:1])),
+           "a lineages export that lost row (4, 2) and repeats another is "
+           "refused, though its row_count matches  <-- pinned defect")
     mixed_counts = counted(fx)["versions"]
     mixed_counts[-1] = dict(mixed_counts[-1], ROW_COUNT="8")
     raises(lambda: build(**dict(fx, versions=mixed_counts)),
@@ -1362,7 +1477,8 @@ def self_test():
             block = sql.split("-- %s.csv" % kind, 1)[1]
             block = block if kind == "deltas" else block.split("\n\n")[0]
             check(all(re.search(r"\b%s\b" % c, block, re.I)
-                      for c in columns + (ROW_COUNT,)),
+                      for c in columns + (ROW_COUNT,) + (
+                          (EXPORTED_AT,) if kind == "versions" else ())),
                   "the %s %s query selects every column the tool requires"
                   % (dbms, kind))
         check(sql.count("COUNT(*) OVER () AS row_count") == 6,
@@ -1409,7 +1525,7 @@ def self_test():
         code, out, _ = run(full + ["--as-of", "2026-09-30"])
         check("as of 2026-09-30 00:00:00" in out
               and "held for 241 day(s)" in out,
-              "--as-of replaces the newest export timestamp")
+              "--as-of replaces the export time")
         code, out, err = run(full + ["--as-of", "2026-01-20"])
         check(code == 2 and out == "" and "is earlier than the newest" in err,
               "an --as-of before the exports exits 2, not a report of "
@@ -1430,8 +1546,8 @@ def self_test():
 
         bom = os.path.join(tmp, "bom.csv")
         with open(bom, "w", newline="", encoding="utf-8-sig") as handle:
-            handle.write("name,owner,state_id,row_count\r\n"
-                         "DEFAULT,SDE,5,1\r\n")
+            handle.write("name,owner,state_id,exported_at,row_count\r\n"
+                         "DEFAULT,SDE,5,2026-09-01 00:00:00,1\r\n")
         check(read_rows(bom, "versions")[0].get("name") == "DEFAULT",
               "a UTF-8 BOM is stripped from the first header  <-- pinned "
               "defect")
@@ -1507,6 +1623,12 @@ def self_test():
         check(code == 2 and "lineages export has no column row_count" in err,
               "a lineages export without row_count exits 2: a file that lost "
               "rows could not be told from a whole one  <-- pinned defect")
+        code, _, err = run(["--versions", export(
+            "noclock.csv", "name,owner,state_id,row_count\n"
+                           "DEFAULT,SDE,9000,1\n")] + base[2:])
+        check(code == 2 and "versions export has no column exported_at" in err,
+              "a versions export without exported_at exits 2: on an idle "
+              "geodatabase every holder would look young  <-- pinned defect")
         code, _, err = run(base + ["--deltas", export(
             "nocount.json", '[{"state_id": 301, "delta_rows": 5}]')])
         check(code == 2 and "deltas export has no column row_count" in err,
@@ -1520,7 +1642,8 @@ def self_test():
         os.mkdir(lost)
         whole = counted(fork212)
         lpaths = write_fixture(lost, {
-            "versions": whole["versions"], "states": whole["states"],
+            "versions": stamped(whole, "2026-09-01 00:00:00")["versions"],
+            "states": whole["states"],
             "lineages": lose_4_2(whole["lineages"])})
         code, out, err = run(["--versions", lpaths["versions"], "--states",
                               lpaths["states"], "--lineages",
@@ -1721,6 +1844,12 @@ def tree(versions, states, extra_versions, replicas=None):
     }
 
 
+def stamped(fx, when):
+    """Canned rows whose versions export records the database clock."""
+    return dict(fx, versions=[dict(r, EXPORTED_AT=when)
+                              for r in fx["versions"]])
+
+
 def fixture():
     """The disaster as synthetic rows: two replicas stuck at generation 0,
     a detached replica version, an old edit version and an orphaned lineage
@@ -1757,6 +1886,9 @@ def fixture():
                    "NAME": "hydrants_field"},
                   {"OBJECTID": "1099", "ITEM_TYPE": "Replica", "ID": "99",
                    "NAME": "no_versions"}])
+    # The database clock the versions SELECT records, five minutes after
+    # the newest state.
+    fx = stamped(fx, "2026-09-20 02:05:00")
     fx["replica_log"] = [
         {"REPLICAID": "1057", "LOGDATE": "2026-01-10 04:00:00",
          "SOURCEENDGEN": "0", "TARGETGEN": "0"},

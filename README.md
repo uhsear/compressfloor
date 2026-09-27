@@ -4,10 +4,10 @@ Name what holds an enterprise geodatabase's compress floor, from exported system
 
 An enterprise geodatabase ran its compress every night. Every night the job exited 0 and the
 compress log said it succeeded. It did this for about 255 nights, and in all that time the
-geodatabase never got close to state 0. Two replicas had never synced past generation 0, so
-their hidden system versions still pointed at a state from months before. A separate lineage of
-states that no version referenced held 1.76 million delta rows. More than 1,500 versions had
-piled up. Nothing alerted, because nothing had failed.
+geodatabase never got close to state 0. Two distributed collaboration replicas had never synced
+past generation 0, so their hidden system versions still pointed at a state from months before.
+A separate lineage of states that no version referenced held 1.76 million delta rows. More than
+1,500 versions had piled up. Nothing alerted, because nothing had failed.
 
 Compress does not fail when something pins it. It removes the states that no version needs, it
 folds the edits that every version shares into the base tables, and then it stops. The point
@@ -25,7 +25,7 @@ compressfloor self-test: no database, no network, no credentials
 --------------------------------------------------------------------
 PASS  the floor is state 17, where the oldest holder forks from DEFAULT
 PASS  DEFAULT is read at state 9000
-PASS  the as-of time is the newest timestamp in the exports, not the local clock
+PASS  the as-of time is the database clock the versions export recorded, not the local clock
 PASS  a registered replica forking at an old state is STALLED  <-- pinned defect
 PASS  and it is named as holding the floor
 PASS  only the holders at the floor state are named as holding it, not the ones above it  <-- pinned defect
@@ -37,10 +37,12 @@ PASS  a lineage no version references, untouched for months, is a blocker  <-- p
 PASS  and it carries the 1,760,000 delta rows supplied for it
 PASS  and it is reported forking from DEFAULT's lineage at state 208
 ...
+PASS  DEFAULT's delta rows at a version's fork state are not counted in its own-branch weight  <-- pinned defect
 PASS  the naive orphan count calls DEFAULT's own ancestor state 10 an orphan  <-- pinned defect
 PASS  the lineage walk finds exactly the three unreferenced states
 PASS  on a healthy tree the naive count finds an orphan and the walk finds none
 ...
+PASS  a fork directly below DEFAULT's own old state is aged from that state, not held for 0 days  <-- pinned defect
 PASS  an as-of time before the newest export timestamp is refused, never a negative age  <-- pinned defect
 PASS  a fork state with no creation time is a blocker, never assumed young  <-- pinned defect
 PASS  and the report says the age is unknown
@@ -64,6 +66,11 @@ PASS  a state above DEFAULT on DEFAULT's own lineage is not DEFAULT's ancestor: 
 PASS  one undated state makes an orphaned lineage's age unknown, even beside a dated one  <-- pinned defect
 PASS  an orphaned lineage says a compress must run before it is blamed on anything  <-- pinned defect
 ...
+PASS  with the export time, the same replica has held the floor for 269 days and is a blocker  <-- pinned defect
+PASS  a blank exported_at is refused, never read as no export time  <-- pinned defect
+...
+PASS  a replica log is read at its highest generation, and a replica that synced past 0 is not called stuck at 0  <-- pinned defect
+...
 PASS  the clean verdict names the limit it used and claims only the exports  <-- pinned defect
 ...
 PASS  a versions export without DEFAULT is refused  <-- pinned defect
@@ -80,6 +87,8 @@ PASS  a row with both STATE_ID and state_id is refused, not read by key order  <
 PASS  a lineages export that lost a row is refused by its row_count, not read as a clean exit 0  <-- pinned defect
 ...
 PASS  a states export that lost its last row is refused, not a clean exit 0 without the orphaned lineage  <-- pinned defect
+PASS  a versions export that lost OLD's row and repeats KEEP's is refused, though its row_count matches  <-- pinned defect
+PASS  a lineages export that lost row (4, 2) and repeats another is refused, though its row_count matches  <-- pinned defect
 ...
 PASS  the sqlserver replicas query sets QUOTED_IDENTIFIER ON before its XML call  <-- pinned defect
 ...
@@ -96,6 +105,7 @@ PASS  a zero-byte replicas export exits 2, it is not zero replicas  <-- pinned d
 PASS  a header-only export of the wrong kind exits 2  <-- pinned defect
 ...
 PASS  a lineages export without row_count exits 2: a file that lost rows could not be told from a whole one  <-- pinned defect
+PASS  a versions export without exported_at exits 2: on an idle geodatabase every holder would look young  <-- pinned defect
 ...
 PASS  a lineages CSV that lost its last row exits 2, not 0  <-- pinned defect
 PASS  a CSV header with state_id twice exits 2  <-- pinned defect
@@ -118,10 +128,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-202 assertions, 0 failed
+213 assertions, 0 failed
 ```
 
-The full run prints all 202 assertions. The `...` lines are where this block is cut.
+The full run prints all 213 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -135,8 +145,11 @@ The full run prints all 202 assertions. The `...` lines are where this block is 
   is easy to schedule.
 
 Neither says which version or replica holds the floor, and neither runs without a live
-connection. This tool does the comparison that the article describes, adds the other three
-holders, and runs offline against exported rows.
+connection. For geodatabase replicas, this tool does the comparison that the article describes.
+It adds the other three holders, and it runs offline against exported rows. For feature service
+replicas, such as the distributed collaboration replicas in the story, it cannot do that
+comparison. It reports their stuck system versions as unresolved blockers (see the worked
+example).
 
 ## Requirements
 
@@ -144,7 +157,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 202 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu (Python
+The same 213 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu (Python
 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -180,7 +193,7 @@ python compressfloor.py ... --report floor.txt --apply
 | `--replica-log` | off | The replica log export. Needs `--replicas`, because the log names a replica by its item `objectid`. |
 | `--deltas` | off | Delta rows per state. Without it, every weight prints as `not supplied`. |
 | `--max-age-days` | `30` | A holder that DEFAULT moved past more than this many days ago is a blocker. `0` makes a blocker of every holder and orphaned lineage older than the as-of time itself. |
-| `--as-of` | newest export timestamp | Measure ages from this time instead. `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`. A time earlier than the newest export timestamp exits 2, because every age would be negative. |
+| `--as-of` | the export time | Measure ages from this time instead of the `exported_at` time in the versions export. `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`. A time earlier than the newest timestamp in the exports exits 2, because every age would be negative. |
 | `--report` | off | Write the report to this file. Needs `--apply`. |
 | `--apply` | off | Write `--report`. Without it nothing is written. |
 | `--sql` | off | Print the SELECTs for `sqlserver`, `postgresql` or `oracle`, and exit. |
@@ -190,8 +203,13 @@ A file whose first non-blank character is `[` or `{` is read as JSON, and it mus
 of objects. Any other file is read as CSV. Column names are matched without regard to case, and
 a UTF-8 byte order mark is removed.
 
-Ages are measured from the newest timestamp in the exports, not from the clock of the machine
-that runs the tool. The same exports therefore give the same report on any day.
+Ages are measured from the database clock at the time of the export, not from the clock of the
+machine that runs the tool. The versions query records that clock in its `exported_at` column.
+The same exports therefore give the same report on any day. A versions export without
+`exported_at` exits 2. Without it, the only clock would be the newest state or replica log
+event. Take a geodatabase where editing stopped soon after a replica stalled. There, every
+holder would look young for ever, and a nightly run would exit 0 each night. The self-test pins
+this case.
 
 ## What it checks
 
@@ -242,7 +260,7 @@ line:
 
 ```
 $ python compressfloor.py --versions versions.csv --states states.csv --lineages lineages.csv --replicas replicas.csv --replica-log replica_log.csv --deltas deltas.csv
-compressfloor: 9 version(s), 14 state(s), 4 replica(s), as of 2026-09-20 02:00:00
+compressfloor: 9 version(s), 14 state(s), 4 replica(s), as of 2026-09-20 02:05:00
 DEFAULT (SDE) is at state 9000
 compress floor: state 17, 253 day(s) old
   compress can fold edits into the base tables no further than state 17
@@ -303,6 +321,43 @@ days before. The two stalled replicas hold the floor at state 17. The detached v
 old edit version would hold it at state 50 if the replicas were fixed. The orphaned lineage
 carries 1.76 million of the 1.8 million delta rows that compress cannot fold.
 
+The worked example uses registered geodatabase replicas, so it can show every class. The story's
+two replicas were distributed collaboration replicas. The geodatabase stores those as `Sync
+Replica` items, and the tool cannot tie a `SYNC_` version to one (see Limits). This is the same
+fixture with replicas 56 and 57 exported as `Sync Replica` items, run through the command line:
+
+```
+$ python compressfloor.py --versions versions.csv --states states.csv --lineages lineages.csv --replicas replicas.csv --replica-log replica_log.csv --deltas deltas.csv
+compressfloor: 9 version(s), 14 state(s), 1 replica(s) and 2 sync replica(s), as of 2026-09-20 02:05:00
+DEFAULT (SDE) is at state 9000
+compress floor: state 17, 253 day(s) old
+  compress can fold edits into the base tables no further than state 17
+  delta rows compress cannot fold: 1,809,012
+
+BLOCKERS (5)
+  UNRESOLVED_REPLICA_VERSION replica 56
+      versions: SYNC_SEND_56_0 (state 17), SYNC_RECEIVE_56_0 (state 17)
+      forks from DEFAULT at state 17, held for 231 day(s); this holds the floor
+      highest sync generation in its version names: 0
+      it has never advanced past sync generation 0
+      delta rows on its own branch: 0
+      no geodatabase replica has this id, and 2 sync replica(s) exist, whose version ids Esri does not document. It may be one of them: do not delete it on TA 000011719's word
+  UNRESOLVED_REPLICA_VERSION replica 57
+      versions: SYNC_SEND_57_0 (state 18)
+      forks from DEFAULT at state 17, held for 231 day(s); this holds the floor
+      highest sync generation in its version names: 0
+      it has never advanced past sync generation 0
+      delta rows on its own branch: 0
+      no geodatabase replica has this id, and 2 sync replica(s) exist, whose version ids Esri does not document. It may be one of them: do not delete it on TA 000011719's word
+...
+VERDICT: 5 blocker(s). Compress will keep exiting 0 and will not fold past state 17.
+```
+
+The run still exits 1, and it still says that each replica never advanced past generation 0.
+It does not name the replicas, and it does not say whether they are stalled or detached. Replica
+48 is `UNRESOLVED_REPLICA_VERSION` too, because a `Sync Replica` item exists. The self-test pins
+these three classifications and the header line.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -321,7 +376,12 @@ run with exit 2:
 - a state on a lineage that is not in the lineages export
 - a states export without state 0
 - a versions export without exactly one DEFAULT row
-- a state that appears twice in the states export
+- a state that appears twice in the states export, a version (owner and name) that appears
+  twice in the versions export, or a lineage and state pair that appears twice in the lineages
+  export
+- a versions export file without an `exported_at` column, or with an `exported_at` that is blank
+  or differs between rows
+- an `exported_at` time earlier than the newest timestamp in the exports
 - two columns in one export whose names differ only in case, such as `STATE_ID` and `state_id`
 - a JSON object that has one key twice, because a JSON reader keeps only the last value and the
   verdict would then depend on key order
@@ -341,6 +401,12 @@ pins both cases. Rows are lost when a client returns only the first rows, such a
 its first 1,048,576 rows, or when a grid is copied one page at a time. Every shipped SELECT
 therefore returns `COUNT(*) OVER () AS row_count`, the number of rows that the query produced,
 on each row.
+
+A paged copy can also repeat one row and lose another, and the count then stays right. None of
+the state, version and lineage tables can hold one key twice, so a repeated key in those exports
+exits 2. The self-test pins a lost-and-repeated versions export and a lost-and-repeated lineages
+export. The deltas and replica log exports can repeat rows legitimately, so they are not checked
+this way.
 
 ## The SQL
 
@@ -386,7 +452,9 @@ separators when saving .csv results" before you save.
 
 ```sql
 -- versions.csv
-SELECT name, owner, state_id, COUNT(*) OVER () AS row_count
+SELECT name, owner, state_id,
+       CONVERT(varchar(19), CURRENT_TIMESTAMP, 120) AS exported_at,
+       COUNT(*) OVER () AS row_count
 FROM sde.SDE_versions;
 
 -- states.csv
@@ -438,7 +506,9 @@ SELECT NULL AS state_id, 0 AS delta_rows WHERE 1 = 0
 
 ```sql
 -- versions.csv
-SELECT name, owner, state_id, COUNT(*) OVER () AS row_count
+SELECT name, owner, state_id,
+       to_char(LOCALTIMESTAMP, 'YYYY-MM-DD HH24:MI:SS') AS exported_at,
+       COUNT(*) OVER () AS row_count
 FROM sde.sde_versions;
 
 -- states.csv
@@ -489,7 +559,9 @@ SELECT NULL::bigint AS state_id, 0::bigint AS delta_rows WHERE 1 = 0
 
 ```sql
 -- versions.csv
-SELECT name, owner, state_id, COUNT(*) OVER () AS row_count
+SELECT name, owner, state_id,
+       TO_CHAR(SYSDATE, 'YYYY-MM-DD HH24:MI:SS') AS exported_at,
+       COUNT(*) OVER () AS row_count
 FROM sde.VERSIONS;
 
 -- states.csv
@@ -555,6 +627,12 @@ The first live run found one defect. `sqlcmd` refused the replica query with Msg
 connects with `QUOTED_IDENTIFIER` off and SQL Server refuses an XML `.value()` call under that
 setting. The query now sets `QUOTED_IDENTIFIER ON`, and an assertion pins it. Microsoft documents
 that SQL Server Management Studio connects with the setting on. SSMS was not part of the test.
+
+The `exported_at` column in the versions query was added after that test. The PostgreSQL form
+was then run with `psql --csv` in a throwaway PostgreSQL 16 container. It returned the same
+`exported_at` value on every row. The SQL Server form (`CURRENT_TIMESTAMP`) and the Oracle form
+(`SYSDATE`) have not been run. Each uses the same conversion as the tested `creation_time`
+column beside it.
 
 These were synthetic schemas, not geodatabases that ArcGIS created. See Limits.
 
@@ -635,7 +713,14 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **Delta counts come from `SDE_mvtables_modified`.** Step 1 of the delta SQL lists only the
   tables that have a row there. A table with delta rows but no such row is not counted.
 - **One clock.** A time zone suffix on a timestamp is ignored, because every timestamp comes from
-  one database. Fractional seconds are dropped.
+  one database. Fractional seconds are dropped. The PostgreSQL versions query reads
+  `LOCALTIMESTAMP`, the time in the session's time zone. If that zone differs from the one the
+  states were written in, every age shifts by the difference. An `exported_at` that is earlier
+  than the newest state exits 2.
+- **Rows without an export time.** A script that imports the tool and passes rows to `build()`
+  directly may leave out `exported_at`. Ages are then measured from the newest timestamp in the
+  rows. On a geodatabase where editing has stopped, that makes a stalled holder look young. The
+  command line refuses a versions export without `exported_at` for this reason.
 - **Everything is read into memory.** One synthetic export had 1,501 versions, 11,501 states and
   3,010,501 lineage rows. It took about 15 seconds on a Windows workstation, almost all of it
   spent reading the CSVs. The time grows with the number of rows.
