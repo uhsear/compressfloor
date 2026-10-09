@@ -139,6 +139,7 @@ PASS  a credential file passed as an export is not echoed  <-- pinned defect
 PASS  a cell that is not a number is named, not echoed  <-- pinned defect
 ...
 PASS  --report without --apply writes nothing  <-- pinned defect
+PASS  a unique prefix of --apply (--ap) is refused by the parser, not read as --apply  <-- pinned defect
 ...
 PASS  --self-test takes no other flag
 PASS  --self-test --max-age-days 5 exits 2, not ignored  <-- pinned defect
@@ -152,10 +153,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-232 assertions, 0 failed
+233 assertions, 0 failed
 ```
 
-The full run prints all 232 assertions. The `...` lines are where this block is cut.
+The full run prints all 233 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -182,7 +183,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 232 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu (Python
+The same 233 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu (Python
 3.12.3) and Windows (Python 3.9.25).
 
 ```

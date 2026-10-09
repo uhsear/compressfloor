@@ -1843,6 +1843,13 @@ def self_test():
         code, out, _ = run(full + ["--report", report_path])
         check(not os.path.exists(report_path) and "was not written" in out,
               "--report without --apply writes nothing  <-- pinned defect")
+        try:
+            code, _, _ = run(full + ["--report", report_path, "--ap"])
+        except SystemExit as exc:
+            code = exc.code
+        check(code == 2 and not os.path.exists(report_path),
+              "a unique prefix of --apply (--ap) is refused by the parser, "
+              "not read as --apply  <-- pinned defect")
         code, out, _ = run(full + ["--report", report_path, "--apply"])
         with open(report_path) as handle:
             written = handle.read()
@@ -2173,8 +2180,9 @@ def read_rows(path, kind):
 
 
 def _parse(argv):
+    # allow_abbrev=False: a unique prefix of --apply must not write the report.
     ap = argparse.ArgumentParser(
-        prog="compressfloor.py",
+        prog="compressfloor.py", allow_abbrev=False,
         description="Name what holds an enterprise geodatabase's compress "
                     "floor, from exported system tables.",
         epilog="Exit 0 nothing in the exports holds the floor past the "
