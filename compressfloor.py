@@ -1061,6 +1061,13 @@ def describe_finding(model, f):
     if kind == DETACHED:
         body.append("no replica has this id: Esri TA 000011719 calls this a "
                     "detached replica system version")
+        if not model["replicas"]:
+            # Unregistered replicas leave exactly this state, so it is not
+            # refused. A copy step that dropped the item rows leaves it too.
+            body.append("the replicas export has no rows at all. If this "
+                        "geodatabase has replicas, the export is incomplete "
+                        "and this is not a detached version: export it "
+                        "again before deleting anything")
     elif kind == UNRESOLVED and model["replicas"] is None:
         body.append("supply --replicas to tell a detached replica from a "
                     "stalled one")
@@ -1257,9 +1264,10 @@ def describe_plan(plan):
             out.append("  drop %d: %s (owner %s, state %d, replica %d)"
                        % (n, key[1], key[0], plan["states"][key],
                           owner_of[key]))
-    out.extend(["", "Esri documents Delete Version for traditional versions. "
-                "Whether it can address a replica system version is not "
-                "documented, and this tool did not test it."])
+        out.extend(["", "Esri TA 000011719 names Delete Version and "
+                    "sdeversion -o delete for detached replica system "
+                    "versions, and warns against deleting any other. This "
+                    "tool tested neither."])
     return out
 
 
@@ -1511,6 +1519,13 @@ def self_test():
           "a detached replica version at DEFAULT's own state is still a "
           "blocker  <-- pinned defect")
     text = "\n".join(describe(build(**young), ry))
+    check("the replicas export has no rows at all" in text
+          and "export it again before deleting anything" in text,
+          "a detached verdict from a replicas export with no rows warns "
+          "that the export may be incomplete  <-- pinned defect")
+    check("no rows at all" not in "\n".join(describe(
+        build(**fx), analyse(build(**fx)))),
+          "and a replicas export with rows carries no such warning")
     check("nothing in the version table holds the floor" in text
           and "this holds the floor" not in text
           and "at state 5, held for 0 day(s)" in text,
@@ -2260,10 +2275,13 @@ def self_test():
     check(p_text.index("replica 56") < p_text.index("replica 57")
           < p_text.index("replica 48"),
           "the entries follow the order of the allowlist")
-    check("Whether it can address a replica system version is not "
-          "documented, and this tool did not test it." in p_lines[-1],
-          "the plan ends by saying Delete Version on a replica system "
-          "version is untested")
+    check(p_lines[-1] == "Esri TA 000011719 names Delete Version and "
+          "sdeversion -o delete for detached replica system versions, and "
+          "warns against deleting any other. This tool tested neither."
+          and "not documented" not in p_text,
+          "the plan ends by citing TA 000011719 for Delete Version on a "
+          "detached version, not by calling it undocumented  <-- pinned "
+          "defect")
     check(all(line.isprintable() for line in p_lines),
           "the plan prints only printable characters")
 
@@ -2290,7 +2308,7 @@ def self_test():
           "30 day limit" in q_text
           and "  warning: its system versions hold nothing now: they sit at "
           "DEFAULT's state, or it has none" in q_text
-          and "TA 000011719" not in q_text,
+          and "Outside this tool: read Esri TA 000011719" not in q_text,
           "the warnings are printed, and an ABSENT replica gets no step "
           "list  <-- pinned defect")
     check("nothing to plan: no Replica item and no SYNC_ version has this "
@@ -2312,7 +2330,7 @@ def self_test():
     r_text = "\n".join(describe_plan(refused))
     check("not planned: no geodatabase replica has this id, and 1 sync "
           "replica(s) exist" in r_text and "may be live" in r_text
-          and "TA 000011719" not in r_text,
+          and "Outside this tool: read Esri TA 000011719" not in r_text,
           "and the plan says why, and a REFUSED replica gets no step list "
           "that leads to a drop  <-- pinned defect")
 
@@ -2566,9 +2584,10 @@ def self_test():
               "defect")
         code, out, _ = run(base + ["--replicas", export(
             "r2.csv", "objectid,item_type,id,name,row_count\n")])
-        check(code == 1 and DETACHED in out,
+        check(code == 1 and DETACHED in out and "no rows at all" in out,
               "a header-only replicas export is read as no replicas, not "
-              "exit 2  <-- pinned defect")
+              "exit 2, and the report says the export may be incomplete"
+              "  <-- pinned defect")
         code, out, _ = run(base + ["--replicas", export("r3.json", "[]")])
         check(code == 1 and DETACHED in out,
               "and so is a JSON [] replicas export")

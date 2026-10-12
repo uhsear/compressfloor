@@ -16,8 +16,8 @@ never syncs, a replica that was unregistered but left its system versions behind
 forgotten edit version. Each holds it at the state where it forked from DEFAULT. Compress still
 exits 0.
 
-The only diagnosis was to run three system-table queries by hand and read the rows. This tool
-reads the exported results of those queries and does the reading.
+The operator diagnosed it by running three system-table queries by hand and reading the rows.
+This tool reads the exported results of those queries and does the reading.
 
 Three later additions use the same offline pattern. An `--exit-on` flag lets a daily monitor
 tell a finding from a failure. A stranded sibling-state view lists, before a compress, the
@@ -57,6 +57,8 @@ PASS  a lineage export without its (lineage, 0) rows gives the same report  <-- 
 ...
 PASS  only the unresolved replica versions are told to supply --replicas, and no finding is told not to delete  <-- pinned defect
 PASS  a detached replica version at DEFAULT's own state is still a blocker  <-- pinned defect
+PASS  a detached verdict from a replicas export with no rows warns that the export may be incomplete  <-- pinned defect
+PASS  and a replicas export with rows carries no such warning
 PASS  and it is not said to hold a floor the header says nothing holds  <-- pinned defect
 PASS  a replica with a fresh SEND and an old RECEIVE forks at the older state and is STALLED
 PASS  and in the other row order too  <-- pinned defect
@@ -173,7 +175,7 @@ PASS  a JSON export after leading blank space is read as JSON, not as CSV
 ...
 PASS  a zero-byte replicas export exits 2, it is not zero replicas  <-- pinned defect
 PASS  a header-only export of the wrong kind exits 2  <-- pinned defect
-PASS  a header-only replicas export is read as no replicas, not exit 2  <-- pinned defect
+PASS  a header-only replicas export is read as no replicas, not exit 2, and the report says the export may be incomplete  <-- pinned defect
 ...
 PASS  a lineages export without row_count exits 2: a file that lost rows could not be told from a whole one  <-- pinned defect
 PASS  a versions export without exported_at exits 2: on an idle geodatabase every holder would look young  <-- pinned defect
@@ -232,10 +234,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-362 assertions, 0 failed
+364 assertions, 0 failed
 ```
 
-The full run prints all 362 assertions. The `...` lines are where this block is cut.
+The full run prints all 364 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -277,7 +279,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 362 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
+The same 364 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
 (Python 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -750,7 +752,7 @@ DROP ORDER (children first, deepest first, across every replica above)
   drop 3: SYNC_SEND_56_0 (owner SDE, state 17, replica 56)
   drop 4: SYNC_SEND_57_0 (owner SDE, state 18, replica 57)
 
-Esri documents Delete Version for traditional versions. Whether it can address a replica system version is not documented, and this tool did not test it.
+Esri TA 000011719 names Delete Version and sdeversion -o delete for detached replica system versions, and warns against deleting any other. This tool tested neither.
 ```
 
 In the fixture, `SYNC_RECEIVE_56_0` is a child of `SYNC_SEND_56_0`. That nesting is synthetic.
@@ -1012,8 +1014,9 @@ lineages export was deleted, the run exited 2 on all three DBMSs.
 The first live run found one defect. `sqlcmd` refused the replica query with Msg 1934, because `sqlcmd`
 connects with `QUOTED_IDENTIFIER` off and SQL Server refuses an XML `.value()` call under that
 setting. The query now sets `QUOTED_IDENTIFIER ON`, and an assertion pins it. Microsoft documents
-that an XML method needs the setting on, and that the ODBC and OLE DB drivers turn it on. SSMS was not
-part of the test, and no source is cited for its default.
+that an XML method needs the setting on, and that the SQL Server Native Client ODBC and OLE DB drivers turn
+it on. That page names Native Client only. SSMS was not part of the test, and no source is cited for its
+default.
 
 These were synthetic schemas, not geodatabases that ArcGIS created. See Limits.
 
@@ -1120,11 +1123,11 @@ that has not synced for months holds the floor exactly as hard as a detached one
   does not prove that a lost save made it, and it does not prove that a compress deletes the
   state's delta rows. Both are `UNVERIFIED` (see "Stranded sibling states").
 - **The unregister plan advises only.** It runs nothing. Its poll rule of 30 seconds, 3 polls
-  and 1,800 seconds is not from Esri. Esri documents Delete Version for traditional versions,
-  and whether it can address a replica system version is not documented. This tool did not
-  test it. Esri also says that several replicas can share one replica version, and the plan
-  matches a version to a replica by its `SYNC_` name only. A shared version under another name
-  is not seen.
+  and 1,800 seconds is not from Esri. Esri TA 000011719 names Delete Version and
+  `sdeversion -o delete` for detached replica system versions, and warns against deleting any
+  other replica system version. This tool tested neither. Esri also says that several replicas can share one replica
+  version, and the plan matches a version to a replica by its `SYNC_` name only. A shared
+  version under another name is not seen.
 - **The version nesting in the plan's fixture is synthetic.** Esri does not document how
   replica system versions nest. The plan reads the real nesting from your `version_tree`
   export.
@@ -1136,8 +1139,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
   as zero rows, and so is a JSON `[]`, for `--replicas`, `--replica-log` and `--deltas` only. The
   other exports exit 2 when they hold no rows. No row then carries a `row_count`, so an export that lost
   every row cannot be told from an empty table. A `--replicas` export like that makes every
-  `SYNC_` version detached, so check that the replica query really returned nothing before you
-  act on it.
+  `SYNC_` version detached, as Esri's article describes for unregistered replicas, so the
+  report adds a line that says the export has no rows at all and may be incomplete. Check that
+  the replica query really returned nothing before you act on it.
 - **A deltas export with a header and no rows is not clean.** With `--state-parents`, the tool
   exits 2 when stranded states exist and the deltas export holds no rows, because it cannot
   tell which of them hold rows. Without `--state-parents`, a header-only deltas file is read as
@@ -1178,6 +1182,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
   a replica by its `SYNC_` name, so unregistering the first replica lists a version that a
   second replica also uses.
 - **The drain-wait numbers are a starting point, not a rule.** They come from one operator.
+  They are placeholders that you tune by editing the three constants.
+- **The drain wait is a printed rule only.** The tool ships no SELECT that counts a replica's
+  `SYNC_` versions, so you must write the count query yourself.
 - **Some Esri Community claims were not re-read.** That most `GPSyncReplica` IDs are -1, and
   that `SYNC_` versions kept a compress from reaching state 0, rest on the two threads listed
   under Sources and are `UNVERIFIED` here.
@@ -1185,6 +1192,45 @@ that has not synced for months holds the floor exactly as hard as a detached one
   the self-test cannot see. They affect only the row numbers in error messages, the
   state the orphan view uses as a tip (every state in that lineage forks the same way), the order of lines the report sorts
   again, and the numbering of plan steps.
+- **A deltas export built from only some of the step 1 lines counts fewer rows.** A stranded
+  state whose rows were left out is then listed as not a blocker, and the run can exit 0. Only
+  a deltas file with no rows at all is refused.
+- **Delta rows keyed to a state that is not in the states export are ignored** without a
+  message. A deltas export taken at another moment than the states export can lower a weight
+  silently.
+- **A JSON export has its columns checked on the first object only.** A later object without
+  `owner` or `name` reads as blank text, not as exit 2, so a `SYNC_` version whose `name` key is
+  missing is reported as an ordinary version.
+- **The self-test does not pin two presentation lines of the plan.** Changing the test for a
+  replica's warning prints `warning: None`, and changing the test for the drop order prints an
+  empty `DROP ORDER` header. The self-test stays green in both cases. No verdict changes.
+- **`UNVERIFIED`: with `--state-parents`, a header-only `--deltas` and `--unregister-plan`
+  together,** the plan's second analysis can raise the stranded-view error after the first
+  analysis passed. By reading the code this ends in exit 2 with no report printed. It was not run.
+- **The fixture's delta count and floor age are rounded stand-ins,** not measurements from any
+  real geodatabase.
+- **Whether `UnregisterReplica` accepts the numeric replica id in the export is not
+  verified.** Esri's example passes a GUID, and the plan prints the numeric `<ID>` from the
+  item definition.
+- **The SQL Server and Oracle forms of the `state_parents` and `version_tree` queries have
+  not been run.** Only the PostgreSQL forms were.
+- **Timings come from a private generator** and were not reproduced from this repository.
+- **The VERDICT line states what compress will do as fact.** On a version-held blocker it
+  prints that compress will keep exiting 0 and will not fold past state N. The tool cannot
+  observe a compress exit code or a state lock, so read that as what the exports show.
+- **Some Esri quotes come from older or archived pages.** The `parent_state_id` quote is from
+  the ArcSDE 10.0 help page, a legacy source. TA 000011719 was read from an archived copy of
+  5 August 2021, not from Esri's live site.
+- **On exit 2 the reason is on stderr, not in the report file.** The monitor examples send
+  only stdout to `floor.txt`, so capture stderr too.
+- **Put no password on the `sqlcmd`, `psql` or `sqlplus` command line.** It lands in shell
+  history and the process list. Use a trusted connection, a password file or a wallet.
+- **If Python is missing or too old to start the file, the exit code is not this tool's.** The
+  shell gives 127, or Python gives 1 for an uncaught error. Run it on Python 3.9 or newer, and
+  read 0, 1 and 2 as verdicts only from a run that printed a report or an `error:` line. Python
+  below 3.9 was not run.
+- **A name that the console cannot encode prints with backslash escapes,** while the
+  `--report` file holds the same name as UTF-8, so the two can differ for non-ASCII names.
 - Only `--report` is ever written, and only with `--apply`. `--self-test` writes its fixture to
   a temporary folder and removes it, and it writes no bytecode cache beside the script. The
   tool opens no socket and imports no network module.
@@ -1268,9 +1314,10 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **The `DROP ORDER` list also names versions of replicas that are still registered.** Read
   the plan top to bottom. Drop none of those versions before that replica is unregistered and
   the exports are taken again.
-- **The `QUOTED_IDENTIFIER` fix is not linked to a Microsoft page.** The need for the setting
-  with an XML method is cited from memory of Microsoft documentation, and the `sqlcmd` default
-  of OFF is not cited. The self-test pins the SQL text, not the server's behaviour.
+- **The `QUOTED_IDENTIFIER` fix is cited, but its `sqlcmd` default is not.** Microsoft's page
+  (see Sources) says the setting must be ON to invoke XML methods and names the Native Client
+  ODBC and OLE DB drivers as setting it ON. It does not name `sqlcmd` or SSMS. The self-test
+  pins the SQL text, not the server's behaviour.
 - **The README's live database claims were not re-run for this version.** The three SQL blocks
   equal the `--sql` output, but the PostgreSQL, SQL Server and Oracle container runs and the
   `sqlcmd` Msg 1934 finding were run in earlier rounds only.
@@ -1315,6 +1362,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - [Delete a traditional version](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/delete-a-traditional-version.html)
   and [Delete Version (Data Management)](https://pro.arcgis.com/en/pro-app/latest/tool-reference/data-management/delete-version.htm):
   a geodatabase administrator who deletes a version deletes its descendant versions too.
+- [SET QUOTED_IDENTIFIER (Transact-SQL)](https://learn.microsoft.com/en-us/sql/t-sql/statements/set-quoted-identifier-transact-sql):
+  the setting must be ON when you invoke `xml` data type methods, and the SQL Server Native
+  Client ODBC and OLE DB drivers set it ON when they connect.
 - [Compress (Data Management)](https://pro.arcgis.com/en/pro-app/latest/tool-reference/data-management/compress.htm)
   and [Replication and versioning](https://pro.arcgis.com/en/pro-app/latest/help/data/geodatabases/overview/replication-and-versioning.htm):
   what compress removes ("states not referenced by a version and redundant rows"), why replica
