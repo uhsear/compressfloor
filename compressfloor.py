@@ -25,12 +25,24 @@ the floor, and neither runs offline against exported rows.
     python compressfloor.py --versions v.csv --states s.csv --lineages l.csv
     python compressfloor.py --versions v.csv --states s.csv --lineages l.csv \\
         --replicas r.csv --replica-log log.csv --deltas d.csv --max-age-days 14
+    python compressfloor.py ... --deltas d.csv --state-parents sp.csv
+    python compressfloor.py ... --replicas r.csv --version-tree vt.csv \\
+        --unregister-plan 56,57
+    python compressfloor.py ... --exit-on never
     python compressfloor.py ... --report floor.txt --apply
 
 Nothing is written without --apply, and only the --report file is ever written.
+The one exception is --self-test, which writes its synthetic fixture files into
+a temporary folder and removes them. It never writes beside the script.
+The stranded view (--state-parents) and the unregister plan (--unregister-plan)
+only read exports and print text. The plan never runs UnregisterReplica, never
+deletes a version and never connects to a database.
 
-Exit codes: 0 nothing in the exports holds the floor past the age limit, 1 at
-least one blocker, 2 the tool could not read its input or write its report.
+Exit codes: 0 no finding of the --exit-on level, 1 at least one, 2 the tool
+could not read its input or write its report. By default (--exit-on blocker) a
+finding is a blocker: a holder past the age limit, or a stranded state that
+holds delta rows. --exit-on any also counts a holder under the limit, and
+--exit-on never turns every finding into exit 0 and keeps exit 2.
 The exports hold versions, not state locks: a connected session's lock on an
 old state can hold compress too, and this tool does not see it.
 """
@@ -48,6 +60,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -71,8 +84,27 @@ STALLED = "STALLED_REPLICA"
 UNRESOLVED = "UNRESOLVED_REPLICA_VERSION"
 ANCIENT = "ANCIENT_VERSION"
 ORPHANED = "ORPHANED_STATES"
+STRANDED = "STRANDED_SIBLING_STATE"
 REPLICA = "REPLICA"
 VERSION = "VERSION"
+
+# What --exit-on counts as a reason to exit 1. blocker is the default and the
+# behaviour before the flag existed.
+EXIT_ON = ("blocker", "any", "never")
+
+# The unregister plan's drain wait. UnregisterReplica returns before the
+# replica's system versions are all released, and the poll count is the only
+# way to see the release end. These numbers came from one operator's run on
+# one geodatabase. No Esri page gives them: tune them to your own estate.
+DRAIN_POLL_SECONDS = 30
+DRAIN_STABLE_POLLS = 3
+DRAIN_TIMEOUT_SECONDS = 1800
+
+# A plan entry's status.
+REGISTERED = "REGISTERED"
+DETACHED_ID = "DETACHED"
+REFUSED = "REFUSED"
+ABSENT = "ABSENT"
 
 # Columns each export must carry. Headers are matched case-insensitively.
 REQUIRED = {
@@ -82,6 +114,8 @@ REQUIRED = {
     "replicas": ("objectid", "item_type", "id", "name"),
     "replica_log": ("replicaid", "logdate", "sourceendgen", "targetgen"),
     "deltas": ("state_id", "delta_rows"),
+    "state_parents": ("state_id", "parent_state_id", "owner"),
+    "version_tree": ("version_id", "parent_version_id", "owner", "name"),
 }
 
 # Every shipped SELECT also returns COUNT(*) OVER () under this name: the
@@ -144,6 +178,15 @@ SELECT replicaid,
        sourceendgen, targetgen, COUNT(*) OVER () AS row_count
 FROM sde.GDB_REPLICALOG;
 
+-- state_parents.csv (optional, needs deltas.csv)
+SELECT state_id, parent_state_id, owner, COUNT(*) OVER () AS row_count
+FROM sde.SDE_states;
+
+-- version_tree.csv (optional)
+SELECT version_id, parent_version_id, owner, name,
+       COUNT(*) OVER () AS row_count
+FROM sde.SDE_versions;
+
 -- deltas.csv (optional), step 1: this SELECT writes one line per versioned table
 SELECT 'UNION ALL SELECT sde_state_id, COUNT(*) FROM ' + r.owner + '.a'
        + CAST(r.registration_id AS varchar(12)) + ' GROUP BY sde_state_id'
@@ -191,6 +234,15 @@ SELECT replicaid,
        sourceendgen, targetgen, COUNT(*) OVER () AS row_count
 FROM sde.gdb_replicalog;
 
+-- state_parents.csv (optional, needs deltas.csv)
+SELECT state_id, parent_state_id, owner, COUNT(*) OVER () AS row_count
+FROM sde.sde_states;
+
+-- version_tree.csv (optional)
+SELECT version_id, parent_version_id, owner, name,
+       COUNT(*) OVER () AS row_count
+FROM sde.sde_versions;
+
 -- deltas.csv (optional), step 1: this SELECT writes one line per versioned table
 SELECT 'UNION ALL SELECT sde_state_id, COUNT(*) FROM ' || r.owner || '.a'
        || r.registration_id || ' GROUP BY sde_state_id'
@@ -237,6 +289,15 @@ SELECT replicaid,
        TO_CHAR(logdate, 'YYYY-MM-DD HH24:MI:SS') AS logdate,
        sourceendgen, targetgen, COUNT(*) OVER () AS row_count
 FROM sde.GDB_REPLICALOG;
+
+-- state_parents.csv (optional, needs deltas.csv)
+SELECT state_id, parent_state_id, owner, COUNT(*) OVER () AS row_count
+FROM sde.STATES;
+
+-- version_tree.csv (optional)
+SELECT version_id, parent_version_id, owner, name,
+       COUNT(*) OVER () AS row_count
+FROM sde.VERSIONS;
 
 -- deltas.csv (optional), step 1: this SELECT writes one line per versioned table
 SELECT 'UNION ALL SELECT sde_state_id, COUNT(*) FROM ' || r.owner || '.a'
@@ -397,7 +458,7 @@ def cell(row, column, kind, index, convert):
 
 
 def build(versions, states, lineages, replicas=None, replica_log=None,
-          deltas=None):
+          deltas=None, state_parents=None, version_tree=None):
     """Turn raw export rows into the model analyse() reasons over.
 
     Every inconsistency between the exports raises InputError rather than
@@ -411,7 +472,7 @@ def build(versions, states, lineages, replicas=None, replica_log=None,
 
     model = {"versions": [], "states": {}, "lineages": {}, "replicas": None,
              "sync_replicas": 0, "log": None, "deltas": None,
-             "exported_at": None}
+             "exported_at": None, "parents": None, "tree": None}
     for i, row in enumerate(states):
         sid = cell(row, "state_id", "states", i, to_int)
         if sid in model["states"]:
@@ -533,7 +594,87 @@ def build(versions, states, lineages, replicas=None, replica_log=None,
             model["deltas"][sid] = (model["deltas"].get(sid, 0)
                                     + cell(row, "delta_rows", "deltas", i,
                                            to_int))
+    if state_parents is not None:
+        read_parents(model, state_parents)
+    if version_tree is not None:
+        read_tree(model, version_tree)
     return model
+
+
+def read_parents(model, rows):
+    """model["parents"]: state id to (parent state id, owner).
+
+    The export must hold exactly the states of the states export. A state
+    missing here, or one only here, means the two were taken at different
+    moments, and a sibling found across them is a sibling of neither.
+    """
+    model["parents"] = {}
+    for i, row in enumerate(normalise(rows, "state_parents")):
+        sid = cell(row, "state_id", "state_parents", i, to_int)
+        if sid in model["parents"]:
+            raise InputError("state_parents export row %d repeats state %d. "
+                             "Rows were copied twice, and others may be "
+                             "lost. Export it again, whole." % (i + 1, sid))
+        model["parents"][sid] = (
+            cell(row, "parent_state_id", "state_parents", i, to_int),
+            text_of(row, "owner"))
+    if set(model["parents"]) != set(model["states"]):
+        raise InputError("the state_parents export and the states export do "
+                         "not hold the same states. Take every export in one "
+                         "sitting.")
+    for sid, (parent, _) in model["parents"].items():
+        # Esri does not say what state 0's own parent holds, so it is not read.
+        if sid and parent not in model["states"]:
+            raise InputError("state %d has parent %d, which the states export "
+                             "does not hold" % (sid, parent))
+        # Esri documents parent_state_id as redundant with the last value of
+        # the state's lineage list, so the two must agree.
+        lineage = model["lineages"][model["states"][sid]["lineage"]]
+        if sid and parent != lineage[bisect.bisect_left(lineage, sid) - 1]:
+            raise InputError("state %d has a parent that its lineage does "
+                             "not show. Take every export in one sitting."
+                             % sid)
+
+
+def read_tree(model, rows):
+    """model["tree"]: (owner, name) to the parent version's (owner, name).
+
+    A root, DEFAULT in practice, maps to None. The export must hold exactly
+    the versions of the versions export, and its parent links must end.
+    """
+    ids = {}
+    parent_ids = {}
+    for i, row in enumerate(normalise(rows, "version_tree")):
+        key = (text_of(row, "owner"), text_of(row, "name"))
+        vid = cell(row, "version_id", "version_tree", i, to_int)
+        if key in parent_ids or vid in ids:
+            raise InputError("version_tree export row %d repeats a version. "
+                             "Rows were copied twice, and others may be "
+                             "lost. Export it again, whole." % (i + 1))
+        ids[vid] = key
+        raw = row.get("parent_version_id")
+        blank = raw is None or str(raw).strip() == ""
+        parent_ids[key] = None if blank else cell(
+            row, "parent_version_id", "version_tree", i, to_int)
+    if set(parent_ids) != set((v["owner"], v["name"])
+                              for v in model["versions"]):
+        raise InputError("the version_tree export and the versions export do "
+                         "not hold the same versions. Take every export in "
+                         "one sitting.")
+    model["tree"] = {}
+    for key, pid in parent_ids.items():
+        if pid is not None and pid not in ids:
+            raise InputError("version %s.%s has a parent version id that the "
+                             "version_tree export does not hold" % key)
+        model["tree"][key] = None if pid is None else ids[pid]
+    for key in model["tree"]:
+        seen = set()
+        while key is not None:
+            if key in seen:
+                raise InputError("the version_tree export's parent links "
+                                 "loop back on themselves")
+            seen.add(key)
+            key = model["tree"][key]
 
 
 def ancestors(model, state_id):
@@ -690,6 +831,10 @@ def analyse(model, max_age_days=DEFAULT_MAX_AGE_DAYS, as_of=None):
             "fork": fork_of(model, tip, anc_default)[0], "age": age,
             "holds_floor": False, "weight": weight(model, sids)})
 
+    if model["parents"] is not None:
+        findings.extend(stranded(model, set(model["states"]) - covered,
+                                 covered, anc_default, as_of))
+
     findings.sort(key=lambda f: (not f["blocker"], f["fork"], str(f["key"])))
     return {"as_of": as_of, "max_age_days": max_age_days,
             "default": default, "floor": floor,
@@ -702,8 +847,62 @@ def analyse(model, max_age_days=DEFAULT_MAX_AGE_DAYS, as_of=None):
                        else len(model["replicas"]))}
 
 
-def gate(report):
-    """Exit 1 when anything is a blocker, else 0."""
+def stranded(model, lost, covered, trunk, as_of):
+    """Unreferenced states that have a later sibling: edits that were saved
+    and then left out of the version.
+
+    A sibling has the same parent state and the same owner. lost holds the
+    states no version's lineage reaches, so no version points at them and none
+    has them as an ancestor. covered holds the states a version does reach: a
+    later sibling in it is the state the version kept. The cause is not
+    proved: undone work can leave the same shape (see the README Limits).
+    A compress removes unreferenced states, so rows still in one are the
+    rows at risk. The weight is that state's own delta rows.
+    """
+    if model["deltas"] is None:
+        raise InputError("the stranded view needs the deltas export: it "
+                         "counts the rows a compress would remove")
+    siblings = {}
+    for sid, group in model["parents"].items():
+        siblings.setdefault(group, []).append(sid)
+    out = []
+    for sid in sorted(lost):
+        parent, owner = model["parents"][sid]
+        later = sorted(x for x in siblings[(parent, owner)] if x > sid)
+        if later:
+            rows = weight(model, [sid])
+            out.append({
+                "kind": STRANDED, "blocker": rows > 0,
+                "key": (STRANDED, sid), "states": [sid], "parent": parent,
+                "owner": owner, "later": [(x, x in covered) for x in later],
+                "fork": fork_of(model, sid, trunk)[0],
+                "age": age_of(model, sid, as_of), "holds_floor": False,
+                "weight": rows})
+    if out and not model["deltas"]:
+        # A header-only deltas file is what step 2 returns when the step 1
+        # lines were left out. Read as "no rows anywhere" it would turn every
+        # stranded blocker into a clean exit 0.
+        raise InputError("the deltas export holds no rows, so the stranded "
+                         "view cannot say which stranded states hold delta "
+                         "rows. Check that step 1 of the deltas SQL returned "
+                         "lines, then export again.")
+    return out
+
+
+def gate(report, exit_on="blocker"):
+    """The exit code for a report. See --exit-on.
+
+    blocker: 1 when any finding is a blocker. any: 1 when anything is
+    listed, a holder under the age limit included. never: always 0. The
+    codes are the tool's verdict only: exit 2 is not a verdict, and main()
+    returns it for a failure whatever --exit-on says.
+    """
+    if exit_on not in EXIT_ON:
+        raise ValueError("exit_on must be one of %s" % ", ".join(EXIT_ON))
+    if exit_on == "never":
+        return 0
+    if exit_on == "any":
+        return 1 if report["findings"] else 0
     return 1 if any(f["blocker"] for f in report["findings"]) else 0
 
 
@@ -770,23 +969,37 @@ def describe(model, report):
     out.append("  delta rows compress cannot fold: %s"
                % number(report["unfoldable"]))
 
+    # A stranded state is also inside an ORPHANED_STATES lineage. The two
+    # answer different questions, so each has its own section and count.
+    strand = [f for f in report["findings"] if f["kind"] == STRANDED]
+    rest = [f for f in report["findings"] if f["kind"] != STRANDED]
     for blocker, title in ((True, "BLOCKERS"),
                            (False, "holding state but under the %d day limit"
                             % report["max_age_days"])):
-        group = [f for f in report["findings"] if f["blocker"] == blocker]
+        group = [f for f in rest if f["blocker"] == blocker]
         if not group:
             continue
         out.append("")
         out.append("%s (%d)" % (title, len(group)))
         for f in group:
             out.extend(describe_finding(model, f))
+    if strand:
+        out.append("")
+        out.append("STRANDED SIBLING STATES (%d)" % len(strand))
+        for f in strand:
+            out.extend(describe_finding(model, f))
 
-    blockers = sum(1 for f in report["findings"] if f["blocker"])
+    blockers = sum(1 for f in rest if f["blocker"])
+    lost = sum(1 for f in strand if f["blocker"])
     out.append("")
     if blockers:
         out.append("VERDICT: %d blocker(s). Compress will keep exiting 0 and "
                    "will not fold past state %d." % (blockers, report["floor"]))
-    else:
+    if lost:
+        out.append("VERDICT: %d stranded state(s) hold delta rows that no "
+                   "version reaches. The next compress removes states no "
+                   "version references: extract the rows first." % lost)
+    if not blockers and not lost:
         out.append("VERDICT: nothing in the exports holds the floor past the "
                    "%d day limit." % report["max_age_days"])
     return out
@@ -795,6 +1008,23 @@ def describe(model, report):
 def describe_finding(model, f):
     """The lines for one finding."""
     kind, key = f["kind"], f["key"]
+    if kind == STRANDED:
+        head = ("state %d, owner %s, parent state %d"
+                % (key[1], f["owner"], f["parent"]))
+        body = ["no version points at state %d or reaches it through its "
+                "lineage" % key[1],
+                "later state(s) with the same parent and owner: %s"
+                % ", ".join("%d (%s)" % (x, "a version reaches it" if r
+                                         else "no version reaches it")
+                            for x, r in f["later"]),
+                "delta rows in this state: %s; created %s"
+                % (number(f["weight"]), "at an unknown time"
+                   if f["age"] is None else "%d day(s) before the as-of time"
+                   % f["age"].days),
+                "a compress removes states no version references"
+                + (": extract these rows first" if f["blocker"] else
+                   ", and this one holds no delta rows")]
+        return ["  %-26s %s" % (kind, head)] + ["      " + b for b in body]
     if kind == ORPHANED:
         head = ("lineage %d: %d state(s) no version references, %d to %d"
                 % (key[1], len(f["states"]), f["states"][0], f["states"][-1]))
@@ -829,6 +1059,188 @@ def describe_finding(model, f):
                     "document. It may be one of them: do not delete it on "
                     "TA 000011719's word" % model["sync_replicas"])
     return ["  %-26s %s" % (kind, head)] + ["      " + b for b in body]
+
+
+# --------------------------------------------------------- unregister plan
+
+def parse_ids(text):
+    """The --unregister-plan allowlist: replica ids, comma separated.
+
+    There is no "all". ASCII digits only: str.isdigit() accepts characters
+    that int() then reads as another number or refuses.
+    """
+    tokens = [t.strip() for t in text.split(",")]
+    if not all(re.fullmatch(r"[0-9]+", t) for t in tokens):
+        raise ValueError("an id list is digits separated by commas, such as "
+                         "56,57")
+    ids = [int(t) for t in tokens]
+    if len(set(ids)) != len(ids):
+        raise ValueError("an id appears twice in the list")
+    return ids
+
+
+def plan_unregister(model, report, ids):
+    """An advisory plan: unregister these replicas, wait, drop what is left.
+
+    Pure. It reads the model and the report and returns data. It runs
+    nothing, and it writes nothing. Only the replica ids in the allowlist
+    are planned, and each is one of four cases:
+
+    REGISTERED: a Replica item has the id, so it is unregistered first.
+    DETACHED: SYNC_ versions carry the id and no Replica item or Sync
+        Replica item can own them (the TA 000011719 case).
+    REFUSED: SYNC_ versions carry the id, no Replica item has it, and a Sync
+        Replica item exists. Esri does not say which number those items'
+        versions carry, so the versions may be live.
+    ABSENT: nothing in the exports has the id.
+
+    The versions of REGISTERED and DETACHED ids are the drop set. A version
+    whose child version is not in the drop set stays: Esri says deleting a
+    version as the geodatabase administrator deletes its descendants too.
+    The rest are ordered children first, deepest first.
+    """
+    if model["replicas"] is None or model["tree"] is None:
+        raise InputError("the unregister plan needs the replicas and "
+                         "version_tree exports")
+    tree = model["tree"]
+    children = {}
+    for key, parent in tree.items():
+        if parent is not None:
+            children.setdefault(parent, []).append(key)
+    by_id = {}
+    for v in model["versions"]:
+        subject, _ = subject_of(v)
+        if subject[0] == REPLICA:
+            by_id.setdefault(subject[1], []).append((v["owner"], v["name"]))
+    status = {}
+    for rid in ids:
+        if rid in model["replicas"]:
+            status[rid] = REGISTERED
+        elif not by_id.get(rid):
+            status[rid] = ABSENT
+        elif model["sync_replicas"]:
+            status[rid] = REFUSED
+        else:
+            status[rid] = DETACHED_ID
+
+    planned = set(k for rid in ids if status[rid] in (REGISTERED, DETACHED_ID)
+                  for k in by_id.get(rid, ()))
+    droppable = set(planned)
+    changed = True
+    while changed:
+        changed = False
+        for key in sorted(droppable):
+            if any(c not in droppable for c in children.get(key, ())):
+                droppable.discard(key)
+                changed = True
+
+    def depth(key):
+        n = 0
+        while tree[key] is not None:
+            key, n = tree[key], n + 1
+        return n
+
+    order = sorted(droppable, key=lambda k: (-depth(k), k))
+    entries = []
+    for rid in ids:
+        mine = by_id.get(rid, ())
+        warning = None
+        if status[rid] == REGISTERED:
+            found = [f for f in report["findings"]
+                     if f["key"] == (REPLICA, rid)]
+            if not found:
+                warning = ("its system versions hold nothing now: they sit "
+                           "at DEFAULT's state, or it has none")
+            elif not found[0]["blocker"]:
+                warning = ("it is not a blocker: %s, within the %d day limit"
+                           % (held(found[0]["age"]), report["max_age_days"]))
+        entries.append({
+            "id": rid, "status": status[rid], "warning": warning,
+            "name": (model["replicas"].get(rid) or {}).get("name"),
+            "order": [k for k in order if k in mine],
+            "blocked": [(k, sorted(c for c in children.get(k, ())
+                                   if c not in droppable)[0])
+                        for k in sorted(mine)
+                        if k in planned and k not in droppable]})
+
+    after = analyse(dict(model, versions=[
+        v for v in model["versions"]
+        if (v["owner"], v["name"]) not in droppable]),
+        report["max_age_days"], report["as_of"])
+    return {"ids": list(ids), "entries": entries, "order": order,
+            "sync": model["sync_replicas"],
+            "floor_now": report["floor"], "floor_after": after["floor"],
+            "states": dict(((v["owner"], v["name"]), v["state"])
+                           for v in model["versions"])}
+
+
+def describe_plan(plan):
+    """The plan as lines of text."""
+    out = ["UNREGISTER PLAN for replica(s) %s"
+           % ", ".join(str(i) for i in plan["ids"]),
+           "nothing was run and nothing is written: this is advice for a "
+           "person to sign for",
+           "compress floor now: state %d. If every version listed for "
+           "dropping is dropped and a compress runs: state %d."
+           % (plan["floor_now"], plan["floor_after"])]
+    for e in plan["entries"]:
+        name = " '%s'" % e["name"] if e["name"] else ""
+        out.extend(["", "replica %d%s: %s" % (e["id"], name, e["status"])])
+        if e["status"] == REFUSED:
+            out.append("  not planned: no geodatabase replica has this id, "
+                       "and %d sync replica(s) exist, whose version ids Esri "
+                       "does not document. These SYNC_ versions may be live."
+                       % plan["sync"])
+            continue
+        if e["status"] == ABSENT:
+            out.append("  nothing to plan: no Replica item and no SYNC_ "
+                       "version has this id")
+            continue
+        if e["warning"]:
+            out.append("  warning: %s" % e["warning"])
+        if e["status"] == REGISTERED:
+            steps = [
+                "Outside this tool: confirm the replica is abandoned and no "
+                "partner still syncs with it. Esri says an unregistered "
+                "replica cannot synchronize changes.",
+                "Unregister it as the replica owner or the geodatabase "
+                "administrator: UnregisterReplica(<geodatabase>, \"%s\"). "
+                "Esri says a replica name must be fully qualified, such as "
+                "owner.name, or you can pass the replica ID.%s"
+                % (e["name"], "" if "." in e["name"] else
+                   " This name has no owner part: check it first."),
+                "Esri says the tool does not delete the replica's version. "
+                "Wait for the release to end: poll the count of this "
+                "replica's SYNC_ versions every %d s, go on when it is "
+                "unchanged for %d polls in a row, and give up after %d s. "
+                "Esri gives no such numbers."
+                % (DRAIN_POLL_SECONDS, DRAIN_STABLE_POLLS,
+                   DRAIN_TIMEOUT_SECONDS),
+                "Export the tables again and run this plan again with the "
+                "same list. A replica with no Replica item is DETACHED, and "
+                "the versions it left are listed in drop order."]
+        else:
+            steps = ["Outside this tool: read Esri TA 000011719 and confirm "
+                     "no live replica owns this id."]
+        steps.append("Versions of this replica in the exports now, children "
+                     "first. Drop only those still there at the last export."
+                     if e["order"] else
+                     "No version of this replica can be dropped from the "
+                     "exports now.")
+        for n, text in enumerate(steps, 1):
+            out.append("  %d. %s" % (n, text))
+        for n, (owner, vname) in enumerate(e["order"], 1):
+            out.append("       drop %d: %s (owner %s, state %d)"
+                       % (n, vname, owner, plan["states"][(owner, vname)]))
+        for (owner, vname), (c_owner, c_name) in e["blocked"]:
+            out.append("       kept: %s (owner %s) has child version %s.%s, "
+                       "which is not dropped. Esri: deleting a version as the "
+                       "geodatabase administrator deletes its descendant "
+                       "versions too." % (vname, owner, c_owner, c_name))
+    out.extend(["", "Esri documents Delete Version for traditional versions. "
+                "Whether it can address a replica system version is not "
+                "documented, and this tool did not test it."])
+    return out
 
 
 # ------------------------------------------------------------------ self-test
@@ -1579,12 +1991,363 @@ def self_test():
            "a deltas export with one row more than its row_count is refused, "
            "not summed twice  <-- pinned defect")
 
+    # ---- --exit-on: what a daily monitor reads
+    check(gate(report) == gate(report, "blocker") == 1
+          and gate(report, "any") == 1 and gate(report, "never") == 0,
+          "blockers exit 1 under blocker and any, and 0 under never")
+    check(gate(young_sync) == 0 and gate(young_sync, "any") == 1
+          and gate(young_sync, "never") == 0,
+          "a holder under the age limit exits 0 by default and 1 under any")
+    check(gate(clean, "any") == 0 and gate(clean, "never") == 0,
+          "a clean run exits 0 under every level")
+    raises(lambda: gate(report, "blockers"),
+           "an exit level the tool does not know is refused, not read as "
+           "the default  <-- pinned defect", ValueError)
+
+    # ---- the stranded sibling-state view, on synthetic rows
+    sx = strand_fixture()
+    sm = build(**sx)
+    sr = analyse(sm)
+    strand = dict((f["key"][1], f) for f in sr["findings"]
+                  if f["kind"] == STRANDED)
+
+    def reached(model, sid):
+        """True when a version points at sid or has it as an ancestor.
+        It uses ancestors(), not the fork walk that analyse() uses."""
+        return any(v["state"] == sid or sid in ancestors(model, v["state"])
+                   for v in model["versions"])
+
+    check(sorted(strand) == [7, 13],
+          "a state no version reaches, with a later state of the same "
+          "parent and owner, is stranded  <-- pinned defect")
+    check(strand[7]["blocker"] and strand[7]["weight"] == 120
+          and strand[7]["later"] == [(8, True)] and strand[7]["parent"] == 5
+          and strand[7]["owner"] == "ED",
+          "and it carries its 120 delta rows, its parent, its owner and the "
+          "later sibling a version kept")
+    check(all(not reached(sm, sid) for sid in strand),
+          "no version points at a stranded state or has it as an ancestor, "
+          "proved with the ancestor walk and not the fork walk")
+    check(reached(sm, 8) and reached(sm, 16) and reached(sm, 5),
+          "and the same proof finds the kept sibling, an ancestor and "
+          "DEFAULT's state reached, so it is not vacuous")
+    check(not strand[13]["blocker"] and strand[13]["weight"] == 0,
+          "a stranded state with no delta rows is listed, not a blocker")
+    check(strand[7]["age"].days == 4 and strand[7]["fork"] == 5,
+          "a stranded state is aged from its own creation time and forks "
+          "where its lineage leaves DEFAULT's")
+    check(set(sid for f in sr["findings"] if f["kind"] == ORPHANED
+              for sid in f["states"]) == set([7, 11, 13, 21]),
+          "the four unreferenced states are still ORPHANED_STATES too: the "
+          "view adds to the report and replaces nothing")
+    check(11 not in strand and 21 not in strand,
+          "a lost state with no later sibling of its owner, or only an "
+          "earlier one, is not stranded  <-- pinned defect")
+    check(16 not in strand and 5 not in strand,
+          "a state a version reaches as an ancestor is not stranded, "
+          "whatever its siblings  <-- pinned defect")
+    s_lines = describe(sm, sr)
+    s_text = "\n".join(s_lines)
+    check("STRANDED SIBLING STATES (2)" in s_text
+          and "state 7, owner ED, parent state 5" in s_text
+          and "no version points at state 7 or reaches it through its "
+          "lineage" in s_text
+          and "later state(s) with the same parent and owner: 8 (a version "
+          "reaches it)" in s_text
+          and "delta rows in this state: 120; created 4 day(s) before the "
+          "as-of time" in s_text
+          and "extract these rows first" in s_text,
+          "the report names the state, the owner, the parent, the later "
+          "sibling and the rows")
+    check("and this one holds no delta rows" in s_text
+          and s_lines[-1].startswith("VERDICT: 1 stranded state(s)")
+          and not any(line.startswith("VERDICT: nothing") for line in s_lines),
+          "a stranded state with no rows says so, and the verdict counts "
+          "only the one that holds rows")
+    check(gate(sr) == 1 and gate(sr, "never") == 0
+          and gate(analyse(build(**dict(sx, deltas=[
+              r for r in sx["deltas"] if r["STATE_ID"] != "7"])))) == 0,
+          "stranded rows exit 1, and a stranded state with no rows exits 0")
+    check([f["kind"] for f in analyse(build(**sx))["findings"]
+           if f["blocker"]] == [STRANDED],
+          "the view's only blocker here is the stranded state")
+    kept_low = analyse(build(**strand_fixture(
+        versions=STRAND_VERSIONS + [("ED_OLD", "ED", 7)])))
+    check(sorted(f["key"][1] for f in kept_low["findings"]
+                 if f["kind"] == STRANDED) == [13],
+          "a version that points at the lower state keeps it from being "
+          "stranded  <-- pinned defect")
+    child = analyse(build(**strand_fixture(
+        states=STRAND_STATES + [(10, 7, 7, "2026-09-10 08:01:00")],
+        owners=dict(list(STRAND_OWNERS.items()) + [(10, "ED")]),
+        versions=STRAND_VERSIONS + [("ED_CHILD", "ED", 10)])))
+    check(sorted(f["key"][1] for f in child["findings"]
+                 if f["kind"] == STRANDED) == [13],
+          "a version that points at a child of the lower state keeps it "
+          "from being stranded  <-- pinned defect")
+    other = analyse(build(**strand_fixture(
+        owners=dict(list(STRAND_OWNERS.items()) + [(8, "OTHER2")]))))
+    check(sorted(f["key"][1] for f in other["findings"]
+                 if f["kind"] == STRANDED) == [13],
+          "a later state of another owner is not a sibling  <-- pinned "
+          "defect")
+    kept_lost = analyse(build(**strand_fixture(
+        versions=[v for v in STRAND_VERSIONS if v[0] != "ED_WO"])))
+    check([f["later"] for f in kept_lost["findings"]
+           if f["kind"] == STRANDED and f["key"][1] == 7] == [[(8, False)]],
+          "a later sibling that no version reaches is reported as such")
+    check("no version reaches it)" in "\n".join(describe(
+        build(**strand_fixture(
+            versions=[v for v in STRAND_VERSIONS if v[0] != "ED_WO"])),
+        kept_lost)),
+          "and the report words it that way")
+    undated = analyse(build(**strand_fixture(states=[
+        (s, ln, p, "" if s == 7 else c) for s, ln, p, c in STRAND_STATES])))
+    check([f["age"] for f in undated["findings"]
+           if f["kind"] == STRANDED and f["key"][1] == 7] == [None]
+          and "created at an unknown time" in "\n".join(describe(
+              build(**strand_fixture(states=[
+                  (s, ln, p, "" if s == 7 else c)
+                  for s, ln, p, c in STRAND_STATES])), undated)),
+          "a stranded state with no creation time says so")
+    plain = fx_without(sx, "state_parents")
+    check(not any(f["kind"] == STRANDED
+                  for f in analyse(build(**plain))["findings"])
+          and "STRANDED" not in "\n".join(describe(
+              build(**plain), analyse(build(**plain)))),
+          "without the state_parents export nothing is stranded and the "
+          "report is the one it was")
+    one_row = analyse(build(**dict(sx, deltas=[
+        dict(r, DELTA_ROWS="1") if r["STATE_ID"] == "7" else r
+        for r in sx["deltas"]])))
+    check([f["blocker"] for f in one_row["findings"]
+           if f["kind"] == STRANDED and f["key"][1] == 7] == [True]
+          and gate(one_row) == 1,
+          "a stranded state with exactly one delta row is a blocker  <-- "
+          "pinned defect")
+    raises(lambda: analyse(build(**dict(sx, deltas=[]))),
+           "a header-only deltas export with stranded candidates is refused, "
+           "not read as no rows  <-- pinned defect")
+    raises(lambda: analyse(build(**fx_without(sx, "deltas"))),
+           "the stranded view without a deltas export is refused: it counts "
+           "rows  <-- pinned defect")
+    raises(lambda: build(**dict(sx, state_parents=sx["state_parents"][1:])),
+           "a state_parents export that lacks a state is refused")
+    raises(lambda: build(**dict(sx, state_parents=sx["state_parents"]
+                                + [dict(sx["state_parents"][0],
+                                        STATE_ID="99")])),
+           "a state_parents export that holds a state the states export "
+           "does not is refused")
+    raises(lambda: build(**dict(sx, state_parents=sx["state_parents"]
+                                + sx["state_parents"][:1])),
+           "a state_parents export that repeats a state is refused  <-- "
+           "pinned defect")
+    raises(lambda: build(**dict(sx, state_parents=[
+        dict(r, PARENT_STATE_ID="404") if r["STATE_ID"] == "7" else r
+        for r in sx["state_parents"]])),
+           "a parent state that the states export does not hold is refused")
+    raises(lambda: build(**dict(sx, state_parents=[
+        dict(r, PARENT_STATE_ID="8") if r["STATE_ID"] == "7" else r
+        for r in sx["state_parents"]])),
+           "a parent state that is in the states export but not in the "
+           "state's lineage is refused  <-- pinned defect")
+    raises(lambda: build(**dict(sx, state_parents=[
+        dict(r, PARENT_STATE_ID="x") if r["STATE_ID"] == "7" else r
+        for r in sx["state_parents"]])),
+           "a parent state id that is not a number is refused")
+    check(len(build(**dict(sx, state_parents=[
+        dict(r, PARENT_STATE_ID="-1") if r["STATE_ID"] == "0" else r
+        for r in sx["state_parents"]]))["parents"]) == 13,
+          "state 0's own parent is not read, because Esri does not say what "
+          "it holds")
+    check(build(**dict(sx, state_parents=[
+        dict(r, OWNER="E\nD") for r in sx["state_parents"]]))["parents"][7]
+          == (5, "E\\nD"),
+          "an owner name from the export is escaped like any other name")
+
+    # ---- the unregister plan, on synthetic rows
+    px = plan_fixture()
+    pm = build(**px)
+    pr = analyse(pm)
+
+    def plan_of(ids, fx=px):
+        model = build(**fx)
+        return plan_unregister(model, analyse(model), ids), model
+
+    plan, _ = plan_of([56, 57, 48])
+    st = dict((e["id"], e) for e in plan["entries"])
+    check([e["status"] for e in plan["entries"]]
+          == [REGISTERED, REGISTERED, DETACHED_ID],
+          "a replica with a Replica item is REGISTERED, one with only SYNC_ "
+          "versions is DETACHED  <-- pinned defect")
+    check(st[56]["order"] == [("SDE", "SYNC_RECEIVE_56_0"),
+                              ("SDE", "SYNC_SEND_56_0")],
+          "a child version is dropped before its parent  <-- pinned defect")
+    check(plan["order"] == [("SDE", "SYNC_RECEIVE_56_0"),
+                            ("SDE", "SYNC_SEND_48_2"),
+                            ("SDE", "SYNC_SEND_56_0"),
+                            ("SDE", "SYNC_SEND_57_0")]
+          and plan["floor_now"] == 17 and plan["floor_after"] == 50,
+          "the plan predicts the floor moves from 17 to 50 when the three "
+          "replicas' versions are gone")
+    check(st[56]["warning"] is None and st[48]["warning"] is None,
+          "a stalled replica and a detached one carry no warning")
+    p_lines = describe_plan(plan)
+    p_text = "\n".join(p_lines)
+    check(p_lines[0] == "UNREGISTER PLAN for replica(s) 56, 57, 48"
+          and "nothing was run and nothing is written" in p_text,
+          "the plan says in its first lines that nothing was run")
+    check("UnregisterReplica(<geodatabase>, \"parcels_to_web\")" in p_text
+          and "Esri says a replica name must be fully qualified, such as "
+          "owner.name, or you can pass the replica ID. "
+          "This name has no owner part: check it first." in p_text,
+          "the unregister step names the replica and warns about a name "
+          "with no owner part")
+    check("poll the count of this replica's SYNC_ versions every 30 s, go "
+          "on when it is unchanged for 3 polls in a row, and give up after "
+          "1800 s. Esri gives no such numbers." in p_text,
+          "the drain wait states its poll rule and says the numbers are not "
+          "Esri's")
+    check("drop 1: SYNC_RECEIVE_56_0 (owner SDE, state 17)" in p_text
+          and "drop 2: SYNC_SEND_56_0 (owner SDE, state 17)" in p_text
+          and "Outside this tool: read Esri TA 000011719" in p_text,
+          "the drops are numbered children first, and a detached replica "
+          "is sent to TA 000011719")
+    check(p_text.index("replica 56") < p_text.index("replica 57")
+          < p_text.index("replica 48"),
+          "the entries follow the order of the allowlist")
+    check("Whether it can address a replica system version is not "
+          "documented, and this tool did not test it." in p_lines[-1],
+          "the plan ends by saying Delete Version on a replica system "
+          "version is untested")
+    check(all(line.isprintable() for line in p_lines),
+          "the plan prints only printable characters")
+
+    dotted = plan_of([56], dict(px, replicas=[
+        dict(r, NAME="SDE." + r["NAME"]) for r in px["replicas"]]))[0]
+    check("This name has no owner part" not in "\n".join(
+        describe_plan(dotted)),
+          "a replica name with an owner part gets no such warning")
+
+    quiet70, _ = plan_of([70, 99, 1])
+    check([e["status"] for e in quiet70["entries"]]
+          == [REGISTERED, REGISTERED, ABSENT]
+          and quiet70["entries"][0]["warning"]
+          == "it is not a blocker: held for 0 day(s), within the 30 day "
+          "limit"
+          and quiet70["entries"][1]["warning"]
+          == "its system versions hold nothing now: they sit at DEFAULT's "
+          "state, or it has none",
+          "a live replica and an empty one are planned with a warning, and "
+          "an id nothing has is ABSENT")
+    q_text = "\n".join(describe_plan(quiet70))
+    check("nothing to plan: no Replica item and no SYNC_ version has this "
+          "id" in q_text
+          and "No version of this replica can be dropped from the exports "
+          "now." in q_text
+          and quiet70["floor_after"] == quiet70["floor_now"] == 17,
+          "ABSENT and empty entries list no drop, and the floor stays")
+
+    sync_fx = dict(px, replicas=[
+        dict(r, ITEM_TYPE="Sync Replica", ID="-1", NAME="collab")
+        if r["ID"] == "56" else r for r in px["replicas"]])
+    refused, _ = plan_of([56, 48, 70], sync_fx)
+    check([e["status"] for e in refused["entries"]]
+          == [REFUSED, REFUSED, REGISTERED]
+          and refused["order"] == [("SDE", "SYNC_SEND_70_12")],
+          "beside a Sync Replica item an unmatched SYNC_ id is REFUSED, and "
+          "none of its versions is listed for dropping  <-- pinned defect")
+    r_text = "\n".join(describe_plan(refused))
+    check("not planned: no geodatabase replica has this id, and 1 sync "
+          "replica(s) exist" in r_text and "may be live" in r_text,
+          "and the plan says why")
+
+    # OLD_DESIGN (version 6) is a child of SYNC_SEND_48_2 (version 5).
+    blocked, _ = plan_of([48], plan_fixture({"OLD_DESIGN": 5}))
+    check(blocked["entries"][0]["order"] == []
+          and blocked["entries"][0]["blocked"]
+          == [(("SDE", "SYNC_SEND_48_2"), ("EDITOR1", "OLD_DESIGN"))]
+          and blocked["floor_after"] == 17,
+          "a replica version with an ordinary child version is kept, and the "
+          "floor does not move  <-- pinned defect")
+    b_text = "\n".join(describe_plan(blocked))
+    check("kept: SYNC_SEND_48_2 (owner SDE) has child version "
+          "EDITOR1.OLD_DESIGN, which is not dropped." in b_text
+          and "deletes its descendant versions too" in b_text,
+          "and the plan names the child and the Esri rule")
+    # A chain: 56's SEND has the child RECEIVE (in the set) and OLD_DESIGN.
+    chain, _ = plan_of([56], plan_fixture({"OLD_DESIGN": 2}))
+    check(chain["order"] == [("SDE", "SYNC_RECEIVE_56_0")]
+          and chain["entries"][0]["blocked"]
+          == [(("SDE", "SYNC_SEND_56_0"), ("EDITOR1", "OLD_DESIGN"))],
+          "a child version that can be dropped is, and its blocked parent "
+          "is kept")
+    trans, _ = plan_of([56, 57], plan_fixture({"SYNC_SEND_57_0": 3,
+                                               "OLD_DESIGN": 4}))
+    check(trans["order"] == [] and trans["floor_after"] == 17
+          and len(trans["entries"][0]["blocked"]) == 2
+          and len(trans["entries"][1]["blocked"]) == 1,
+          "a version whose child stays is kept, and so is every ancestor "
+          "of it in the drop set  <-- pinned defect")
+    deep, _ = plan_of([56, 57], plan_fixture({"SYNC_SEND_57_0": 3}))
+    check(deep["order"] == [("SDE", "SYNC_SEND_57_0"),
+                            ("SDE", "SYNC_RECEIVE_56_0"),
+                            ("SDE", "SYNC_SEND_56_0")]
+          and deep["entries"][0]["order"] == [("SDE", "SYNC_RECEIVE_56_0"),
+                                              ("SDE", "SYNC_SEND_56_0")],
+          "drops are ordered deepest first across replicas, and each entry "
+          "keeps that order  <-- pinned defect")
+
+    check(parse_ids("56, 57") == [56, 57] and parse_ids("0") == [0],
+          "an id list is digits separated by commas")
+    for bad in ("", "all", "56,", "56,x", "-1", "5.0", "\u00b2", "\u0663", "56,56"):
+        raises(lambda: parse_ids(bad),
+               "the id list %s is refused  <-- pinned defect" % ascii(bad),
+               ValueError)
+    raises(lambda: plan_unregister(build(**fx_without(px, "version_tree")),
+                                   pr, [56]),
+           "a plan without the version_tree export is refused")
+    raises(lambda: plan_unregister(build(**fx_without(px, "replicas")),
+                                   pr, [56]),
+           "a plan without the replicas export is refused")
+
+    # ---- the version_tree export
+    check(pm["tree"][("SDE", "SYNC_RECEIVE_56_0")] == ("SDE", "SYNC_SEND_56_0")
+          and pm["tree"][("SDE", "DEFAULT")] is None,
+          "the tree maps a version to its parent, and DEFAULT to none")
+    nulls = build(**dict(px, version_tree=[
+        dict(r, PARENT_VERSION_ID=None) if r["VERSION_ID"] == "1" else r
+        for r in px["version_tree"]]))
+    check(nulls["tree"][("SDE", "DEFAULT")] is None,
+          "a JSON null parent is a root")
+    raises(lambda: build(**dict(px, version_tree=px["version_tree"][1:])),
+           "a version_tree export that lacks a version is refused")
+    raises(lambda: build(**dict(px, version_tree=px["version_tree"]
+                                + px["version_tree"][:1])),
+           "a version_tree export that repeats a version is refused  <-- "
+           "pinned defect")
+    raises(lambda: build(**dict(px, version_tree=px["version_tree"][:-1]
+                                + [dict(px["version_tree"][-1],
+                                        VERSION_ID="8")])),
+           "a version_tree export that gives two versions one id is refused")
+    raises(lambda: build(**dict(px, version_tree=[
+        dict(r, PARENT_VERSION_ID="404") if r["VERSION_ID"] == "2" else r
+        for r in px["version_tree"]])),
+           "a parent version id that no row holds is refused")
+    raises(lambda: build(**dict(px, version_tree=[
+        dict(r, PARENT_VERSION_ID="x") if r["VERSION_ID"] == "2" else r
+        for r in px["version_tree"]])),
+           "a parent version id that is not a number is refused")
+    raises(lambda: build(**dict(px, version_tree=[
+        dict(r, PARENT_VERSION_ID="3") if r["VERSION_ID"] == "2" else r
+        for r in px["version_tree"]])),
+           "parent links that loop are refused, not walked for ever  <-- "
+           "pinned defect")
+
     # ---- the SQL the README tells the user to run
     for dbms in ("sqlserver", "postgresql", "oracle"):
         sql = SQL[dbms]
-        check(all(("-- %s.csv" % k) in sql for k in
-                  ("versions", "states", "lineages", "replicas",
-                   "replica_log", "deltas")),
+        check(all(("-- %s.csv" % k) in sql for k in REQUIRED),
               "the %s SQL produces every export the tool reads" % dbms)
         writes = re.findall(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|"
                             r"TRUNCATE|MERGE|GRANT|EXEC)\b", sql, re.I)
@@ -1598,9 +2361,9 @@ def self_test():
                           (EXPORTED_AT,) if kind == "versions" else ())),
                   "the %s %s query selects every column the tool requires"
                   % (dbms, kind))
-        check(sql.count("COUNT(*) OVER () AS row_count") == 6,
-              "the %s SQL counts the rows of all six exports, so a lost row "
-              "is caught" % dbms)
+        check(sql.count("COUNT(*) OVER () AS row_count") == len(REQUIRED),
+              "the %s SQL counts the rows of all %d exports, so a lost row "
+              "is caught" % (dbms, len(REQUIRED)))
 
     # sqlcmd connects with QUOTED_IDENTIFIER OFF, and SQL Server refuses an
     # XML .value() call under that setting (Msg 1934). The live sqlcmd run
@@ -1682,6 +2445,13 @@ def self_test():
         code, _, err = run(base[:4] + ["--lineages", notlist])
         check(code == 2 and "array of objects" in err,
               "a JSON export that is not an array exits 2")
+        for body in ("{}", "[1]"):
+            with open(notlist, "w") as handle:
+                handle.write(body)
+            code, _, err = run(base[:4] + ["--lineages", notlist])
+            check(code == 2 and "array of objects" in err,
+                  "an empty JSON object or an array of non-objects exits 2 "
+                  "(%s)  <-- pinned defect" % body)
         badjson = os.path.join(tmp, "bad.json")
         with open(badjson, "w") as handle:
             handle.write("[{")
@@ -1862,6 +2632,185 @@ def self_test():
         check(code == 2 and "could not write" in err,
               "a report path that cannot be written exits 2, not 1")
 
+        # ---- --exit-on, through the command line and through a real process
+        code, out, _ = run(full + ["--exit-on", "never"])
+        check(code == 0 and out.splitlines() == DISASTER_REPORT,
+              "--exit-on never prints the same report and exits 0 with five "
+              "blockers")
+        check(run(full + ["--exit-on", "blocker"])[0] == 1
+              and run(full + ["--exit-on", "any"])[0] == 1,
+              "--exit-on blocker and any exit 1 on the disaster")
+        solo = os.path.join(tmp, "solo")
+        os.mkdir(solo)
+        solo_fx = fx_without(stamped(tree(
+            [("DEFAULT", "SDE", 5)],
+            [(0, 0, 0, "2026-01-01 00:00:00"), (5, 0, 0, "2026-08-30 00:00:00"),
+             (6, 0, 5, "2026-08-31 00:00:00"), (9, 0, 6, "2026-09-01 00:00:00")],
+            [("SYNC_SEND_12_0", "SDE", 5)]), "2026-09-02 00:00:00"),
+            "replicas")
+        sp = write_fixture(solo, solo_fx)
+        solo_args = ["--versions", sp["versions"], "--states", sp["states"],
+                     "--lineages", sp["lineages"]]
+        check([run(solo_args + ["--exit-on", level])[0]
+               for level in ("blocker", "any", "never")] == [0, 1, 0]
+              and run(solo_args)[0] == 0,
+              "a holder under the age limit exits 0 by default and under "
+              "never, and 1 under any")
+        flat = os.path.join(tmp, "flat")
+        os.mkdir(flat)
+        flat_fx = stamped(tree(
+            [("DEFAULT", "SDE", 5)],
+            [(0, 0, 0, "2026-09-01 00:00:00"), (5, 0, 0, "2026-09-01 00:00:00")],
+            [], None), "2026-09-02 00:00:00")
+        fp = write_fixture(flat, fx_without(flat_fx, "replicas"))
+        check([run(["--versions", fp["versions"], "--states", fp["states"],
+                    "--lineages", fp["lineages"], "--exit-on", level])[0]
+               for level in EXIT_ON] == [0, 0, 0],
+              "a clean run exits 0 under every --exit-on level")
+        code, out, err = run(base[:4] + ["--lineages", os.path.join(
+            tmp, "absent.csv"), "--exit-on", "never"])
+        check(code == 2 and out == "" and "absent.csv" in err,
+              "--exit-on never does not turn a failure into exit 0  <-- "
+              "pinned defect")
+        try:
+            code, _, _ = run(full + ["--exit-on", "bogus"])
+        except SystemExit as exc:
+            code = exc.code
+        check(code == 2, "an unknown --exit-on level exits 2")
+        for flag in (["--exit", "never"], ["--unreg", "56"],
+                     ["--state-p", "x"], ["--version-t", "x"],
+                     ["--rep", "x"]):
+            try:
+                code, _, _ = run(full + flag)
+            except SystemExit as exc:
+                code = exc.code
+            check(code == 2,
+                  "the prefix %s is refused by the parser, not read as a "
+                  "flag  <-- pinned defect" % flag[0])
+        check(_parse([])[0].allow_abbrev is False,
+              "the parser is built with allow_abbrev=False")
+        for extra in (["--exit-on", "any"], ["--unregister-plan", "56"],
+                      ["--state-parents", "x"], ["--version-tree", "x"]):
+            code, _, err = run(["--self-test"] + extra)
+            check(code == 2 and "--self-test takes no other flag" in err,
+                  "--self-test %s exits 2, not ignored  <-- pinned defect"
+                  % extra[0])
+            code, _, err = run(["--sql", "oracle"] + extra)
+            check(code == 2 and "--sql takes no other flag" in err,
+                  "--sql %s exits 2, not ignored  <-- pinned defect"
+                  % extra[0])
+
+        here = os.path.abspath(__file__)
+
+        def process(args):
+            """The exit code of a real run of this file."""
+            return subprocess.run([sys.executable, "-B", here] + args,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE).returncode
+
+        check([process(full), process(full + ["--exit-on", "any"]),
+               process(full + ["--exit-on", "never"]), process(solo_args),
+               process(base[:4] + ["--lineages", os.path.join(
+                   tmp, "absent.csv")]),
+               process(full + ["--exit-on", "bogus"])]
+              == [1, 1, 0, 0, 2, 2],
+              "a real process exits 1 on blockers, 0 under never, 0 on a "
+              "holder under the limit and 2 on a failure")
+
+        # ---- the stranded view, through the command line
+        sdir = os.path.join(tmp, "strand")
+        os.mkdir(sdir)
+        spaths = write_fixture(sdir, sx)
+        sargs = ["--versions", spaths["versions"], "--states", spaths["states"],
+                 "--lineages", spaths["lineages"], "--deltas",
+                 spaths["deltas"], "--state-parents", spaths["state_parents"]]
+        code, out, _ = run(sargs)
+        check(code == 1 and out.splitlines() == describe(sm, sr),
+              "the stranded view end to end exits 1 and prints what the "
+              "core describes")
+        check(run(sargs + ["--exit-on", "never"])[0] == 0,
+              "and exits 0 under --exit-on never")
+        code, _, err = run(sargs[:6] + ["--state-parents",
+                                        spaths["state_parents"]])
+        check(code == 2 and "needs the deltas export" in err,
+              "--state-parents without --deltas exits 2  <-- pinned defect")
+        jspaths = write_fixture(sdir, sx, as_json=True)
+        code, out, _ = run(["--versions", jspaths["versions"], "--states",
+                            jspaths["states"], "--lineages",
+                            jspaths["lineages"], "--deltas",
+                            jspaths["deltas"], "--state-parents",
+                            jspaths["state_parents"]])
+        check(code == 1 and out.splitlines() == describe(sm, sr),
+              "the same exports as JSON give the same stranded view")
+        code, _, err = run(sargs[:8] + ["--state-parents", export(
+            "sp_nocount.csv", "state_id,parent_state_id,owner\n0,0,SDE\n")])
+        check(code == 2 and "state_parents export has no column row_count"
+              in err,
+              "a state_parents export without row_count exits 2")
+        sdel = sargs[:7] + [export("deltas_header.csv",
+                                   "state_id,delta_rows,row_count\n")]
+        code, out, err = run(sdel + sargs[8:])
+        check(code == 2 and "deltas export holds no rows" in err
+              and "VERDICT" not in out,
+              "a header-only deltas export with the stranded view exits 2, "
+              "not 0  <-- pinned defect")
+        code, out, err = run(sdel)
+        check(code == 0 and "delta rows compress cannot fold: 0" in out,
+              "and without --state-parents it is still read as zero rows")
+
+        # ---- the unregister plan, through the command line
+        pdir = os.path.join(tmp, "plan")
+        os.mkdir(pdir)
+        ppaths = write_fixture(pdir, px)
+        pargs = ["--versions", ppaths["versions"], "--states",
+                 ppaths["states"], "--lineages", ppaths["lineages"],
+                 "--replicas", ppaths["replicas"], "--replica-log",
+                 ppaths["replica_log"], "--deltas", ppaths["deltas"],
+                 "--version-tree", ppaths["version_tree"]]
+        listing = sorted(os.listdir(pdir))
+        loaded = set(sys.modules)
+        code, out, _ = run(pargs + ["--unregister-plan", "56,57,48"])
+        check(code == 1 and out.splitlines() == describe(pm, pr) + [""]
+              + describe_plan(plan_unregister(pm, pr, [56, 57, 48])),
+              "the plan end to end follows the report, and the exit code is "
+              "still the report's")
+        check(sorted(os.listdir(pdir)) == listing
+              and not (set(sys.modules) - loaded) & set(
+                  ["arcpy", "pyodbc", "socket"])
+              and "arcpy" not in sys.modules and "pyodbc" not in sys.modules,
+              "the plan wrote no file and loaded no arcpy, pyodbc or "
+              "socket module  <-- pinned defect")
+        check(run(pargs + ["--unregister-plan", "56", "--exit-on",
+                           "never"])[0] == 0,
+              "the plan honours --exit-on never")
+        for flags, want in (
+                (["--unregister-plan", "56"] + pargs[:-2],
+                 "--unregister-plan needs --replicas and --version-tree"),
+                (["--unregister-plan", "56"] + pargs[:6] + pargs[10:],
+                 "--unregister-plan needs --replicas and --version-tree"),
+                (["--unregister-plan", "all"] + pargs, "digits separated by "
+                 "commas"),
+                (["--unregister-plan", ""] + pargs, "digits separated by "
+                 "commas"),
+                (["--unregister-plan", "56,56"] + pargs, "appears twice")):
+            code, out, err = run(flags)
+            check(code == 2 and out == "" and want in err,
+                  "--unregister-plan %r is refused with exit 2: %s"
+                  % (flags[1], want))
+        plan_report = os.path.join(pdir, "plan.txt")
+        code, out, _ = run(pargs + ["--unregister-plan", "56", "--report",
+                                    plan_report])
+        check(not os.path.exists(plan_report) and "was not written" in out,
+              "--report without --apply does not write the plan either")
+        run(pargs + ["--unregister-plan", "56", "--report", plan_report,
+                     "--apply"])
+        with open(plan_report) as handle:
+            written_plan = handle.read()
+        check(sorted(os.listdir(pdir)) == sorted(listing + ["plan.txt"])
+              and "UNREGISTER PLAN for replica(s) 56" in written_plan,
+              "with --apply the plan goes into the report file, and that is "
+              "the only file written")
+
         code, out, _ = run(["--sql", "postgresql"])
         check(code == 0 and out == SQL["postgresql"],
               "--sql prints the shipped SQL for one DBMS and exits 0")
@@ -2020,7 +2969,7 @@ def fixture():
                   {"OBJECTID": "1057", "ITEM_TYPE": "Replica", "ID": "57",
                    "NAME": "roads_to_web"},
                   {"OBJECTID": "1070", "ITEM_TYPE": "Replica", "ID": "70",
-                   "NAME": "hydrants_field"},
+                   "NAME": "assets_field"},
                   {"OBJECTID": "1099", "ITEM_TYPE": "Replica", "ID": "99",
                    "NAME": "no_versions"}])
     # The database clock the versions SELECT records, five minutes after
@@ -2038,6 +2987,72 @@ def fixture():
         {"STATE_ID": "208", "DELTA_ROWS": "44000"},
         {"STATE_ID": "9000", "DELTA_ROWS": "12"},
         {"STATE_ID": "10", "DELTA_ROWS": "900"}]
+    return fx
+
+
+def fx_without(fx, kind):
+    """Canned rows with one export left out."""
+    return dict((k, v) for k, v in fx.items() if k != kind)
+
+
+def parents(states, owners):
+    """Canned state_parents rows from tree()'s state tuples."""
+    return [{"STATE_ID": str(s), "PARENT_STATE_ID": str(p),
+             "OWNER": owners.get(s, "SDE")} for s, _, p, _ in states]
+
+
+# Every state below is a child of state 5, DEFAULT's, except 17. Each editor
+# saved once and a version kept the later state, so 7 and 13 are the earlier
+# saves that no version reaches. 11 and 21 are unreached too, but each is the
+# newest state of its owner. 16 is reached through its child 17.
+STRAND_STATES = [
+    (0, 0, 0, "2026-01-01 00:00:00"), (5, 0, 0, "2026-09-01 00:00:00"),
+    (7, 7, 5, "2026-09-10 08:00:00"), (8, 8, 5, "2026-09-10 08:03:00"),
+    (9, 9, 5, "2026-09-11 09:00:00"), (11, 11, 5, "2026-09-12 10:00:00"),
+    (13, 13, 5, "2026-09-13 10:00:00"), (14, 14, 5, "2026-09-13 10:02:00"),
+    (16, 16, 5, "2026-09-12 11:00:00"), (17, 16, 16, "2026-09-12 11:05:00"),
+    (18, 18, 5, "2026-09-12 12:00:00"), (20, 20, 5, "2026-09-14 08:00:00"),
+    (21, 21, 5, "2026-09-14 08:10:00")]
+STRAND_OWNERS = {7: "ED", 8: "ED", 9: "OTHER", 11: "OTHER", 13: "MAP",
+                 14: "MAP", 16: "PX", 17: "PX", 18: "PX", 20: "QA",
+                 21: "QA"}
+STRAND_VERSIONS = [("ED_WO", "ED", 8), ("OTHER_V", "OTHER", 9),
+                   ("MAP_V", "MAP", 14), ("CHILD_V", "PX", 17),
+                   ("PX_NEW", "PX", 18), ("QA_V", "QA", 20)]
+
+
+def strand_fixture(states=STRAND_STATES, owners=STRAND_OWNERS,
+                   versions=STRAND_VERSIONS):
+    """Synthetic rows for the stranded sibling-state view."""
+    fx = fx_without(stamped(tree([("DEFAULT", "SDE", 5)], states,
+                                 list(versions)), "2026-09-15 00:00:00"),
+                    "replicas")
+    fx["deltas"] = [{"STATE_ID": str(s), "DELTA_ROWS": str(n)} for s, n in (
+        (7, 120), (8, 3), (9, 40), (11, 7), (13, 0), (14, 2), (17, 5),
+        (21, 1))]
+    fx["state_parents"] = parents(states, owners)
+    return fx
+
+
+# (owner, name, version id, parent version id) for fixture()'s nine versions.
+# SYNC_RECEIVE_56_0 is a child of SYNC_SEND_56_0. The rest are children of
+# DEFAULT. Real replica system versions may nest differently: this is a
+# synthetic shape that exercises the ordering.
+PLAN_TREE = [("SDE", "DEFAULT", 1, None), ("SDE", "SYNC_SEND_56_0", 2, 1),
+             ("SDE", "SYNC_RECEIVE_56_0", 3, 2), ("SDE", "SYNC_SEND_57_0", 4, 1),
+             ("SDE", "SYNC_SEND_48_2", 5, 1), ("EDITOR1", "OLD_DESIGN", 6, 1),
+             ("SDE", "SYNC_SEND_70_12", 7, 1), ("EDITOR2", "WO_NEW", 8, 1),
+             ("EDITOR3", "QA", 9, 1)]
+
+
+def plan_fixture(parent_ids=None):
+    """The disaster fixture plus its version tree. parent_ids maps a version
+    name to another parent version id."""
+    fx = fixture()
+    fx["version_tree"] = [
+        {"OWNER": o, "NAME": n, "VERSION_ID": str(i),
+         "PARENT_VERSION_ID": "" if p is None else str(
+             (parent_ids or {}).get(n, p))} for o, n, i, p in PLAN_TREE]
     return fx
 
 
@@ -2088,7 +3103,7 @@ DISASTER_REPORT = [
     "n since a version was deleted, run one and export again",
     "",
     "holding state but under the 30 day limit (3)",
-    "  REPLICA                    replica 70 'hydrants_field'",
+    "  REPLICA                    replica 70 'assets_field'",
     "      versions: SYNC_SEND_70_12 (state 901)",
     "      forks from DEFAULT at state 900, held for 0 day(s)",
     "      highest sync generation in its version names: 12",
@@ -2185,9 +3200,9 @@ def _parse(argv):
         prog="compressfloor.py", allow_abbrev=False,
         description="Name what holds an enterprise geodatabase's compress "
                     "floor, from exported system tables.",
-        epilog="Exit 0 nothing in the exports holds the floor past the "
-               "limit, 1 blockers, 2 the input could not be read. Only "
-               "--report is ever written, and only with --apply.")
+        epilog="Exit 0 no finding of the --exit-on level, 1 a finding, 2 "
+               "the input could not be read. Only --report is ever "
+               "written, and only with --apply.")
     ap.add_argument("--versions", help="the version table export")
     ap.add_argument("--states", help="the state table export")
     ap.add_argument("--lineages", help="the state lineage table export")
@@ -2196,6 +3211,21 @@ def _parse(argv):
                     help="the replica log export (optional, needs "
                          "--replicas)")
     ap.add_argument("--deltas", help="delta rows per state (optional)")
+    ap.add_argument("--state-parents", dest="state_parents",
+                    help="the parent state and owner of each state (optional, "
+                         "needs --deltas): adds the stranded sibling state "
+                         "view")
+    ap.add_argument("--version-tree", dest="version_tree",
+                    help="the parent version of each version (optional): "
+                         "orders the --unregister-plan drops")
+    ap.add_argument("--unregister-plan", dest="unregister_plan",
+                    help="replica ids, comma separated (needs --replicas and "
+                         "--version-tree): print an advisory plan to "
+                         "unregister them. Nothing is run.")
+    ap.add_argument("--exit-on", dest="exit_on", choices=EXIT_ON,
+                    help="what makes the exit code 1: blocker (default), any "
+                         "listed holder, or never. A failure is exit 2 "
+                         "either way.")
     # No argparse default: None tells "not given" from "--max-age-days 30",
     # so --self-test and --sql can refuse it. _main() applies the default.
     ap.add_argument("--max-age-days", dest="max_age_days", type=int,
@@ -2237,9 +3267,10 @@ def main(argv=None):
 
 def _main(args):
     exports = ("versions", "states", "lineages", "replicas", "replica_log",
-               "deltas")
+               "deltas", "state_parents", "version_tree")
     # Every flag but --self-test and --sql. An ignored flag reads as obeyed.
-    others = [k for k in exports + ("report", "as_of", "max_age_days")
+    others = [k for k in exports + ("report", "as_of", "max_age_days",
+                                    "unregister_plan", "exit_on")
               if getattr(args, k) is not None] + ["apply"] * args.apply
 
     if args.self_test:
@@ -2259,6 +3290,15 @@ def _main(args):
     if args.replica_log and not args.replicas:
         return fail("--replica-log needs --replicas: the log names replicas "
                     "by item objectid, and only that export maps it.")
+    if args.unregister_plan and not (args.replicas and args.version_tree):
+        return fail("--unregister-plan needs --replicas and --version-tree: "
+                    "the plan must tell a registered replica from a detached "
+                    "one, and order the drops.")
+    try:
+        ids = parse_ids(args.unregister_plan) if (
+            args.unregister_plan is not None) else None
+    except ValueError as exc:
+        return fail("--unregister-plan: %s." % exc)
     if args.max_age_days is None:
         args.max_age_days = DEFAULT_MAX_AGE_DAYS
     if args.max_age_days < 0:
@@ -2287,6 +3327,8 @@ def _main(args):
         return fail(str(exc))
 
     lines = describe(model, report)
+    if ids:
+        lines += [""] + describe_plan(plan_unregister(model, report, ids))
     for line in lines:
         print(line)
 
@@ -2302,7 +3344,7 @@ def _main(args):
             # that could not be written is a different fact.
             return fail("could not write %s: %s" % (args.report, exc))
         print("\nwrote %s" % args.report)
-    return gate(report)
+    return gate(report, args.exit_on or "blocker")
 
 
 if __name__ == "__main__":

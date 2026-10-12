@@ -3,11 +3,11 @@
 Name what holds an enterprise geodatabase's compress floor, from exported system tables.
 
 An enterprise geodatabase ran its compress every night. Every night the job exited 0 and the
-compress log said it succeeded. It did this for about 255 nights, and in all that time the
+compress log said it succeeded. It did this for months of nights, and in all that time the
 geodatabase never got close to state 0. Two distributed collaboration replicas had never synced
 past generation 0, so their hidden system versions still pointed at a state from months before.
-A separate lineage of states that no version referenced held 1.76 million delta rows. More than
-1,500 versions had piled up. Nothing alerted, because nothing had failed.
+A separate lineage of states that no version referenced held over a million delta rows. Over a
+thousand versions had piled up. Nothing alerted, because nothing had failed.
 
 Compress does not fail when something pins it. It removes the states that no version needs, it
 folds the edits that every version shares into the base tables, and then it stops. The point
@@ -19,8 +19,12 @@ exits 0.
 The only diagnosis was to run three system-table queries by hand and read the rows. This tool
 reads the exported results of those queries and does the reading.
 
+Three later additions use the same offline pattern. An `--exit-on` flag lets a daily monitor
+tell a finding from a failure. A stranded sibling-state view lists, before a compress, the
+states that hold rows no version reaches. A plan-only replica unregister orders the steps and
+never runs one. Each has its own section below.
+
 ```
-$ python compressfloor.py --self-test
 compressfloor self-test: no database, no network, no credentials
 --------------------------------------------------------------------
 PASS  the floor is state 17, where the oldest holder forks from DEFAULT
@@ -104,6 +108,54 @@ PASS  a replicas export that lost replica 57's row and repeats 56's is refused, 
 PASS  a replicas export that lost a Replica row and repeats a Sync Replica row is refused by its objectid  <-- pinned defect
 ...
 PASS  a deltas export with one row more than its row_count is refused, not summed twice  <-- pinned defect
+PASS  blockers exit 1 under blocker and any, and 0 under never
+PASS  a holder under the age limit exits 0 by default and 1 under any
+...
+PASS  an exit level the tool does not know is refused, not read as the default  <-- pinned defect
+PASS  a state no version reaches, with a later state of the same parent and owner, is stranded  <-- pinned defect
+...
+PASS  no version points at a stranded state or has it as an ancestor, proved with the ancestor walk and not the fork walk
+PASS  and the same proof finds the kept sibling, an ancestor and DEFAULT's state reached, so it is not vacuous
+...
+PASS  a lost state with no later sibling of its owner, or only an earlier one, is not stranded  <-- pinned defect
+PASS  a state a version reaches as an ancestor is not stranded, whatever its siblings  <-- pinned defect
+...
+PASS  a version that points at the lower state keeps it from being stranded  <-- pinned defect
+PASS  a version that points at a child of the lower state keeps it from being stranded  <-- pinned defect
+PASS  a later state of another owner is not a sibling  <-- pinned defect
+...
+PASS  the stranded view without a deltas export is refused: it counts rows  <-- pinned defect
+...
+PASS  a state_parents export that repeats a state is refused  <-- pinned defect
+...
+PASS  a parent state that is in the states export but not in the state's lineage is refused  <-- pinned defect
+...
+PASS  a replica with a Replica item is REGISTERED, one with only SYNC_ versions is DETACHED  <-- pinned defect
+PASS  a child version is dropped before its parent  <-- pinned defect
+PASS  the plan predicts the floor moves from 17 to 50 when the three replicas' versions are gone
+...
+PASS  the drain wait states its poll rule and says the numbers are not Esri's
+...
+PASS  beside a Sync Replica item an unmatched SYNC_ id is REFUSED, and none of its versions is listed for dropping  <-- pinned defect
+...
+PASS  a replica version with an ordinary child version is kept, and the floor does not move  <-- pinned defect
+...
+PASS  a version whose child stays is kept, and so is every ancestor of it in the drop set  <-- pinned defect
+PASS  drops are ordered deepest first across replicas, and each entry keeps that order  <-- pinned defect
+...
+PASS  the id list '' is refused  <-- pinned defect
+PASS  the id list 'all' is refused  <-- pinned defect
+PASS  the id list '56,' is refused  <-- pinned defect
+PASS  the id list '56,x' is refused  <-- pinned defect
+PASS  the id list '-1' is refused  <-- pinned defect
+PASS  the id list '5.0' is refused  <-- pinned defect
+PASS  the id list '\xb2' is refused  <-- pinned defect
+PASS  the id list '\u0663' is refused  <-- pinned defect
+PASS  the id list '56,56' is refused  <-- pinned defect
+...
+PASS  a version_tree export that repeats a version is refused  <-- pinned defect
+...
+PASS  parent links that loop are refused, not walked for ever  <-- pinned defect
 ...
 PASS  the sqlserver replicas query sets QUOTED_IDENTIFIER ON before its XML call  <-- pinned defect
 ...
@@ -141,6 +193,31 @@ PASS  a cell that is not a number is named, not echoed  <-- pinned defect
 PASS  --report without --apply writes nothing  <-- pinned defect
 PASS  a unique prefix of --apply (--ap) is refused by the parser, not read as --apply  <-- pinned defect
 ...
+PASS  a holder under the age limit exits 0 by default and under never, and 1 under any
+...
+PASS  --exit-on never does not turn a failure into exit 0  <-- pinned defect
+...
+PASS  the prefix --exit is refused by the parser, not read as a flag  <-- pinned defect
+PASS  the prefix --unreg is refused by the parser, not read as a flag  <-- pinned defect
+PASS  the prefix --state-p is refused by the parser, not read as a flag  <-- pinned defect
+PASS  the prefix --version-t is refused by the parser, not read as a flag  <-- pinned defect
+PASS  the prefix --rep is refused by the parser, not read as a flag  <-- pinned defect
+PASS  the parser is built with allow_abbrev=False
+PASS  --self-test --exit-on exits 2, not ignored  <-- pinned defect
+PASS  --sql --exit-on exits 2, not ignored  <-- pinned defect
+PASS  --self-test --unregister-plan exits 2, not ignored  <-- pinned defect
+PASS  --sql --unregister-plan exits 2, not ignored  <-- pinned defect
+PASS  --self-test --state-parents exits 2, not ignored  <-- pinned defect
+PASS  --sql --state-parents exits 2, not ignored  <-- pinned defect
+PASS  --self-test --version-tree exits 2, not ignored  <-- pinned defect
+PASS  --sql --version-tree exits 2, not ignored  <-- pinned defect
+PASS  a real process exits 1 on blockers, 0 under never, 0 on a holder under the limit and 2 on a failure
+...
+PASS  --state-parents without --deltas exits 2  <-- pinned defect
+PASS  a header-only deltas export with the stranded view exits 2, not 0  <-- pinned defect
+...
+PASS  the plan wrote no file and loaded no arcpy, pyodbc or socket module  <-- pinned defect
+...
 PASS  --self-test takes no other flag
 PASS  --self-test --max-age-days 5 exits 2, not ignored  <-- pinned defect
 PASS  --self-test --max-age-days 30 exits 2, not ignored  <-- pinned defect
@@ -153,10 +230,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-233 assertions, 0 failed
+355 assertions, 0 failed
 ```
 
-The full run prints all 233 assertions. The `...` lines are where this block is cut.
+The full run prints all 355 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -170,7 +247,22 @@ The full run prints all 233 assertions. The `...` lines are where this block is 
   growing state count is a real early signal, and the script is easy to schedule. Its orphaned
   state count uses the query that "Why the obvious version is wrong" shows to be misleading.
 
-Neither says which version or replica holds the floor, and neither runs without a live
+- **Esri's Unregister Replica and Delete Version tools.** The
+  [Unregister Replica](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/unregister-replica.html)
+  page says the tool does not delete the replica's version. The
+  [Delete a traditional version](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/delete-a-traditional-version.html)
+  page says that a geodatabase administrator who deletes a version deletes its descendant
+  versions too. Both are accurate, and they do the work. They do not order a set of leftover
+  versions, and they do not say where the floor will sit afterwards. The plan in this tool
+  does that, and it runs neither tool.
+
+A search of GitHub repositories on 2026-10-12 with `gh search repos` found no repository for
+"UnregisterReplica arcpy", "geodatabase compress state_lineages", "arcgis replica version
+cleanup script" or "enterprise geodatabase orphan states". A code search for `UnregisterReplica`
+returned only wrappers of Esri's tool and unrelated projects. That says nothing about private
+code, and it is not a claim that no such tool exists.
+
+Neither of the first two says which version or replica holds the floor, and neither runs without a live
 connection. For geodatabase replicas, this tool does the comparison that the article describes.
 It adds the other three holders, and it runs offline against exported rows. For feature service
 replicas, such as the distributed collaboration replicas in the story, it cannot do that
@@ -183,8 +275,8 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 233 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu (Python
-3.12.3) and Windows (Python 3.9.25).
+The same 355 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
+(Python 3.12.3) and Windows (Python 3.9.25).
 
 ```
 git clone https://github.com/uhsear/compressfloor.git
@@ -207,6 +299,9 @@ python compressfloor.py --versions versions.csv --states states.csv --lineages l
 python compressfloor.py --versions versions.csv --states states.csv --lineages lineages.csv \
     --replicas replicas.csv --replica-log replica_log.csv --deltas deltas.csv
 python compressfloor.py ... --max-age-days 14 --as-of 2026-09-21
+python compressfloor.py ... --deltas deltas.csv --state-parents state_parents.csv
+python compressfloor.py ... --replicas replicas.csv --version-tree version_tree.csv --unregister-plan 56,57
+python compressfloor.py ... --exit-on never
 python compressfloor.py ... --report floor.txt --apply
 ```
 
@@ -218,12 +313,20 @@ python compressfloor.py ... --report floor.txt --apply
 | `--replicas` | off | The replica items export. Without it, a replica system version cannot be called detached or stalled. |
 | `--replica-log` | off | The replica log export. Needs `--replicas`, because the log names a replica by its item `objectid`. |
 | `--deltas` | off | Delta rows per state. Without it, every weight prints as `not supplied`. |
+| `--state-parents` | off | The parent state and owner of each state. Needs `--deltas`. Adds the stranded sibling state view. |
+| `--version-tree` | off | The parent version of each version. Orders the drops in `--unregister-plan`. |
+| `--unregister-plan` | off | Replica ids, comma separated. Needs `--replicas` and `--version-tree`. Prints an advisory plan and runs nothing. |
+| `--exit-on` | `blocker` | What makes the exit code 1: `blocker`, `any` or `never`. Exit 2 is a failure at every level. |
 | `--max-age-days` | `30` | A holder that DEFAULT moved past more than this many days ago is a blocker. `0` makes a blocker of every holder and orphaned lineage older than the as-of time itself. |
 | `--as-of` | the export time | Measure ages from this time instead of the `exported_at` time in the versions export. `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`, 24-hour. A time earlier than the newest timestamp in the exports exits 2, because every age would be negative. |
 | `--report` | off | Write the report to this file. Needs `--apply`. |
 | `--apply` | off | Write `--report`. Without it nothing is written. |
 | `--sql` | off | Print the SELECTs for `sqlserver`, `postgresql` or `oracle`, and exit. Takes no other flag. |
 | `--self-test` | off | Run the assertions and exit. Takes no other flag. |
+
+The parser refuses an abbreviated flag, so `--ap` is not `--apply`. The self-test pins this for
+`--ap`, `--exit`, `--unreg`, `--state-p`, `--version-t` and `--rep`. `--sql` and `--self-test`
+refuse every other flag, the four added ones included.
 
 A file whose first non-blank character is `[` or `{` is read as JSON, and it must be an array
 of objects. Any other file is read as CSV. Column names are matched without regard to case, and
@@ -257,6 +360,7 @@ the floor since today. A holder held for longer than `--max-age-days` is a block
 | `UNRESOLVED_REPLICA_VERSION` | held past the age limit | A `SYNC_` version that the tool cannot tie to a replica: no `--replicas` was given, or the geodatabase has `Sync Replica` items (see below). |
 | `ANCIENT_VERSION` | held past the age limit | An ordinary version that forks from DEFAULT at an old state. |
 | `ORPHANED_STATES` | its newest state is past the age limit | States that no version's lineage reaches, grouped by lineage. |
+| `STRANDED_SIBLING_STATE` | it holds delta rows | Only with `--state-parents`. An unreferenced state with a later state of the same parent and owner (see "Stranded sibling states"). |
 
 A replica system version is recognised by the names in TA 000011719: `SYNC_SEND_<id>_<gen>`,
 `SYNC_RECEIVE_<id>_<gen>` and `SYNC_RECEIVE_REC_<id>_<gen>`. For each replica the report prints
@@ -323,7 +427,7 @@ BLOCKERS (5)
       a compress removes states no version needs: if none has run since a version was deleted, run one and export again
 
 holding state but under the 30 day limit (3)
-  REPLICA                    replica 70 'hydrants_field'
+  REPLICA                    replica 70 'assets_field'
       versions: SYNC_SEND_70_12 (state 901)
       forks from DEFAULT at state 900, held for 0 day(s)
       highest sync generation in its version names: 12
@@ -391,16 +495,64 @@ It does not name the replicas, and it does not say whether they are stalled or d
 are still `Replica` items, so the header counts 2 replicas and 2 sync replicas. The self-test
 pins these three classifications and the header line.
 
-## Exit codes
+## Exit codes for a daily monitor
 
 | Code | Meaning |
 |---|---|
-| 0 | Nothing in the exports holds the floor past the age limit. The exports do not show state locks, so this is not proof that nothing holds it (see Limits). |
-| 1 | At least one blocker. |
+| 0 | No finding at the `--exit-on` level. By default this means nothing in the exports holds the floor past the age limit. The exports do not show state locks, so this is not proof that nothing holds it (see Limits). |
+| 1 | At least one finding at that level. By default, a finding is a blocker. |
 | 2 | The tool could not do its job: an export could not be read or was a zero-byte file, the exports disagree with each other, a flag was wrong, `--as-of` is earlier than the exports, `--report` could not be written, or the tool itself hit an error. A header-only CSV or a JSON `[]` is read as zero rows, not as exit 2 (see Limits). |
 
 Exit 2 is kept apart from exit 1 on purpose. A monitor that cannot read its input must never
-look like a monitor that found nothing, and it must never look like a finding either.
+look like a monitor that found nothing, and it must never look like a finding either. Exit 2
+does not depend on `--exit-on`: a failure is exit 2 at every level.
+
+`--exit-on` chooses what counts as a finding. Without the flag, the tool behaves as it did
+before the flag existed.
+
+| `--exit-on` | Exit 1 when | Use it when |
+|---|---|---|
+| `blocker` (default) | Any finding is a blocker. A stranded state that holds delta rows is a blocker. | The monitor must alert on a problem. |
+| `any` | Anything is listed, a holder under the age limit included. | You want to see every version that is behind DEFAULT before it ages into a blocker. |
+| `never` | Never. | The scheduler treats every non-zero exit as a failure, and you read the report for the findings. |
+
+Under `never`, exit 0 means that the tool ran. It does not mean that the exports are clean. A
+monitor that uses `never` must read the report. Its `VERDICT` line says what the run found.
+
+A monitor that must tell a finding from a failure reads the exit code. This is a POSIX shell
+version:
+
+```sh
+python3 compressfloor.py --versions versions.csv --states states.csv --lineages lineages.csv > floor.txt
+case $? in
+  0) echo "monitor: clean" ;;
+  1) echo "monitor: findings, see floor.txt" ;;
+  *) echo "monitor: compressfloor itself failed" ;;
+esac
+```
+
+This is a PowerShell version:
+
+```powershell
+python compressfloor.py --versions versions.csv --states states.csv --lineages lineages.csv | Out-File floor.txt
+switch ($LASTEXITCODE) {
+    0       { "monitor: clean" }
+    1       { "monitor: findings, see floor.txt" }
+    default { "monitor: compressfloor itself failed" }
+}
+```
+
+Both were run on the self-test's disaster fixture, written out as CSV files. Each run added one
+argument at the end of the `compressfloor.py` line. This is what each printed:
+
+| Added argument | Windows, Git Bash `sh` | Windows PowerShell 5.1 | Ubuntu 24.04 `sh` |
+|---|---|---|---|
+| none | `monitor: findings, see floor.txt` | `monitor: findings, see floor.txt` | `monitor: findings, see floor.txt` |
+| `--exit-on never` | `monitor: clean` | `monitor: clean` | `monitor: clean` |
+| a `--lineages` file that does not exist | `monitor: compressfloor itself failed` | `monitor: compressfloor itself failed` | `monitor: compressfloor itself failed` |
+
+The self-test also starts real processes of the tool. It checks that the process exit codes are
+1 on blockers, 0 under `never`, 0 for a holder under the age limit, and 2 for a failure.
 
 The exports are checked against each other before anything is reported. Each of these stops the
 run with exit 2:
@@ -424,6 +576,11 @@ run with exit 2:
 - an export file without a `row_count` column
 - an export whose number of rows differs from its `row_count`, or whose rows do not all hold
   the same `row_count`
+- a `state_parents` export that holds other states than the states export, repeats a state, or
+  gives a state a parent that its lineage does not show
+- a `version_tree` export that holds other versions than the versions export, repeats a version
+  or a version id, names a parent version that it does not hold, or has parent links that loop
+- the stranded view without a deltas export
 
 Exports taken at different moments disagree, and a floor computed from them is a floor of
 neither.
@@ -444,6 +601,156 @@ those exports exits 2. In the replicas export the key is the item `objectid`, an
 system versions would be reported as detached, and TA 000011719 would send you to delete them.
 The self-test pins a lost-and-repeated export for versions, lineages and replicas. The deltas
 and replica log exports can repeat rows legitimately, so they are not checked this way.
+
+## Stranded sibling states
+
+An editor saves, and the version keeps a later state. The edit that was saved first stays in a
+state that no version reaches. The next compress removes states that no version references. This
+view lists those states before the compress runs.
+
+It needs two more exports: `--deltas`, to count the rows, and `--state-parents`, which holds
+each state's parent state and owner. A state is stranded when both of these are true:
+
+1. No version points at the state, and no version has it as an ancestor.
+2. Another state has the same parent state and the same owner, and a larger state id.
+
+A stranded state that holds delta rows is a blocker, whatever its age. A compress can remove
+it at any time, so its age does not matter. A stranded state with no delta rows is listed and
+is not a blocker. Every stranded state is also inside an `ORPHANED_STATES` lineage. The two
+answer different questions, so the report gives the stranded states their own section and count.
+Without `--state-parents`, nothing in the report changes.
+
+This is the synthetic fixture from the self-test, written out as CSV files. Its stranded states
+are 7 and 13. State 11 and state 21 are unreferenced too, but each is the newest state of its
+owner, so they are not stranded. State 16 has a later sibling, but a version reaches it through
+its child 17. Only the end of the report is shown:
+
+```
+$ python compressfloor.py --versions versions.csv --states states.csv --lineages lineages.csv --deltas deltas.csv --state-parents state_parents.csv
+...
+STRANDED SIBLING STATES (2)
+  STRANDED_SIBLING_STATE     state 7, owner ED, parent state 5
+      no version points at state 7 or reaches it through its lineage
+      later state(s) with the same parent and owner: 8 (a version reaches it)
+      delta rows in this state: 120; created 4 day(s) before the as-of time
+      a compress removes states no version references: extract these rows first
+  STRANDED_SIBLING_STATE     state 13, owner MAP, parent state 5
+      no version points at state 13 or reaches it through its lineage
+      later state(s) with the same parent and owner: 14 (a version reaches it)
+      delta rows in this state: 0; created 1 day(s) before the as-of time
+      a compress removes states no version references, and this one holds no delta rows
+
+VERDICT: 1 stranded state(s) hold delta rows that no version reaches. The next compress removes states no version references: extract the rows first.
+```
+
+Exit code 1. With `--exit-on never` the same run exits 0.
+
+What was shown, and what was not:
+
+- **Shown, on synthetic rows: no version points at a stranded state.** The self-test checks
+  this clause for each stranded state with `ancestors()`, which reads the state lineage table.
+  The tool finds the stranded states by a different walk, from each version down to DEFAULT's
+  lineage. The self-test runs the same check on a kept sibling, an ancestor and DEFAULT's own
+  state, and it finds all three reached, so the check is not empty. It also runs four cases
+  that must not be stranded: a version that points at the lower state, a version that points
+  at a child of the lower state, a later state of another owner, and a later state that has
+  only an earlier sibling.
+- **`UNVERIFIED`: that a lost save is why such a state exists.** The idea comes from one
+  observation on one production geodatabase, which was not reproduced here. No Esri page that
+  was read describes a save that ends in a sibling state. Undone work can leave the same
+  shape, so read the list as candidates. The tool proves that no version reaches the state. It
+  does not prove why.
+- **`UNVERIFIED`: that a compress deletes the delta rows of an unreferenced state.** The
+  Compress tool page says compress removes "states not referenced by a version and redundant
+  rows". It does not say in so many words that the rows of an unreferenced state go with it.
+  Extract the rows before you compress, as the report says.
+
+The `state_parents` export is checked against the lineages. Esri documents `parent_state_id`
+as "redundant with the last value of the lineage list". The tool therefore refuses a state
+whose parent is not the id before it in its own lineage. It also refuses an export that holds a
+different set of states than the states export does.
+
+## Unregister plan
+
+`--unregister-plan 56,57,48` prints an ordered plan. The plan unregisters the replicas with
+those ids and then drops the system versions that they leave. The tool runs none of it. It
+never calls `UnregisterReplica`, never deletes a version, never connects to a database, and
+never imports `arcpy` or a database driver. A person signs for every step.
+
+It needs `--replicas` and `--version-tree`. The id list is an allowlist: digits separated by
+commas. There is no `all`. Only the versions of the ids in the list are planned. Each id gets
+one of four statuses:
+
+| Status | When | What the plan does |
+|---|---|---|
+| `REGISTERED` | A `Replica` item has the id. | Unregister it, wait, export again, then list its versions in drop order. |
+| `DETACHED` | `SYNC_` versions carry the id. No `Replica` item has it, and no `Sync Replica` item exists. | Send the reader to TA 000011719, then list the versions in drop order. |
+| `REFUSED` | `SYNC_` versions carry the id. No `Replica` item has it, and a `Sync Replica` item exists. | Plan nothing. Esri does not say which number a `Sync Replica` item's versions carry, so these versions may be live. |
+| `ABSENT` | Nothing in the exports has the id. | Plan nothing. |
+
+For a `REGISTERED` replica that is not a blocker in the report, the plan adds a warning. The
+replica may be live. The allowlist is your decision, and the plan does not override it.
+
+**Drop order.** The version tree comes from `--version-tree`. The plan lists the versions
+children first, deepest first. A version whose child version is not in the drop set stays, and
+so does every ancestor of it in the set. Esri says that when the geodatabase administrator
+deletes a version, its descendant versions are deleted too. A replica system version with an
+ordinary version under it is therefore never listed for dropping, because the drop would remove
+the ordinary version as well. The plan prints the child's name.
+
+**Drain wait.** The Unregister Replica tool page says the tool does not delete the replica's
+version. The plan therefore tells you to export again and to run the plan again. A replica that
+has no `Replica` item is then `DETACHED`, and the versions that it left are listed in drop
+order. Between the unregister and the re-export, the plan prints a poll rule: count the
+replica's `SYNC_` versions every 30 seconds, go on when the count is unchanged for 3 polls, and
+give up after 1,800 seconds. These three numbers are `UNVERIFIED`. They come from one
+operator's runs on one geodatabase. No Esri page gives them. They are constants at the top of
+the file, `DRAIN_POLL_SECONDS`, `DRAIN_STABLE_POLLS` and `DRAIN_TIMEOUT_SECONDS`. Change them
+for your estate.
+
+**Predicted floor.** The plan also says where the compress floor would sit if every listed
+version were gone and a compress had run. It runs the same analysis on the exports with those
+versions removed. It assumes that nothing else changes.
+
+This is the fixture from the self-test, written out as CSV files, with the allowlist
+`56,57,48`. The report comes first, and the first `...` stands for it. The long Esri notes in steps 1 to 4 are cut with `...` after the first words:
+
+```
+$ python compressfloor.py --versions versions.csv --states states.csv --lineages lineages.csv --replicas replicas.csv --replica-log replica_log.csv --deltas deltas.csv --version-tree version_tree.csv --unregister-plan 56,57,48
+...
+UNREGISTER PLAN for replica(s) 56, 57, 48
+nothing was run and nothing is written: this is advice for a person to sign for
+compress floor now: state 17. If every version listed for dropping is dropped and a compress runs: state 50.
+
+replica 56 'parcels_to_web': REGISTERED
+  1. Outside this tool: confirm the replica is abandoned and no partner still syncs with it. ...
+  2. Unregister it as the replica owner or the geodatabase administrator: UnregisterReplica(<geodatabase>, "parcels_to_web"). ...
+  3. Esri says the tool does not delete the replica's version. Wait for the release to end: ...
+  4. Export the tables again and run this plan again with the same list. ...
+  5. Versions of this replica in the exports now, children first. Drop only those still there at the last export.
+       drop 1: SYNC_RECEIVE_56_0 (owner SDE, state 17)
+       drop 2: SYNC_SEND_56_0 (owner SDE, state 17)
+
+replica 57 'roads_to_web': REGISTERED
+  ...
+  5. Versions of this replica in the exports now, children first. Drop only those still there at the last export.
+       drop 1: SYNC_SEND_57_0 (owner SDE, state 18)
+
+replica 48: DETACHED
+  1. Outside this tool: read Esri TA 000011719 and confirm no live replica owns this id.
+  2. Versions of this replica in the exports now, children first. Drop only those still there at the last export.
+       drop 1: SYNC_SEND_48_2 (owner SDE, state 50)
+
+Esri documents Delete Version for traditional versions. Whether it can address a replica system version is not documented, and this tool did not test it.
+```
+
+In the fixture, `SYNC_RECEIVE_56_0` is a child of `SYNC_SEND_56_0`. That nesting is synthetic.
+Esri does not document how replica system versions nest, so the self-test builds the shape to
+exercise the ordering. The plan reads the real nesting from your `version_tree` export.
+
+The self-test runs the plan through the command line and checks that it wrote no file and
+loaded no `arcpy`, `pyodbc` or `socket` module. With `--apply`, the plan goes into the
+`--report` file, and that file is the only one written.
 
 ## The SQL
 
@@ -522,6 +829,15 @@ SELECT replicaid,
        sourceendgen, targetgen, COUNT(*) OVER () AS row_count
 FROM sde.GDB_REPLICALOG;
 
+-- state_parents.csv (optional, needs deltas.csv)
+SELECT state_id, parent_state_id, owner, COUNT(*) OVER () AS row_count
+FROM sde.SDE_states;
+
+-- version_tree.csv (optional)
+SELECT version_id, parent_version_id, owner, name,
+       COUNT(*) OVER () AS row_count
+FROM sde.SDE_versions;
+
 -- deltas.csv (optional), step 1: this SELECT writes one line per versioned table
 SELECT 'UNION ALL SELECT sde_state_id, COUNT(*) FROM ' + r.owner + '.a'
        + CAST(r.registration_id AS varchar(12)) + ' GROUP BY sde_state_id'
@@ -574,6 +890,15 @@ SELECT replicaid,
        to_char(logdate, 'YYYY-MM-DD HH24:MI:SS') AS logdate,
        sourceendgen, targetgen, COUNT(*) OVER () AS row_count
 FROM sde.gdb_replicalog;
+
+-- state_parents.csv (optional, needs deltas.csv)
+SELECT state_id, parent_state_id, owner, COUNT(*) OVER () AS row_count
+FROM sde.sde_states;
+
+-- version_tree.csv (optional)
+SELECT version_id, parent_version_id, owner, name,
+       COUNT(*) OVER () AS row_count
+FROM sde.sde_versions;
 
 -- deltas.csv (optional), step 1: this SELECT writes one line per versioned table
 SELECT 'UNION ALL SELECT sde_state_id, COUNT(*) FROM ' || r.owner || '.a'
@@ -628,6 +953,15 @@ SELECT replicaid,
        sourceendgen, targetgen, COUNT(*) OVER () AS row_count
 FROM sde.GDB_REPLICALOG;
 
+-- state_parents.csv (optional, needs deltas.csv)
+SELECT state_id, parent_state_id, owner, COUNT(*) OVER () AS row_count
+FROM sde.STATES;
+
+-- version_tree.csv (optional)
+SELECT version_id, parent_version_id, owner, name,
+       COUNT(*) OVER () AS row_count
+FROM sde.VERSIONS;
+
 -- deltas.csv (optional), step 1: this SELECT writes one line per versioned table
 SELECT 'UNION ALL SELECT sde_state_id, COUNT(*) FROM ' || r.owner || '.a'
        || r.registration_id || ' GROUP BY sde_state_id'
@@ -653,7 +987,7 @@ throwaway container: PostgreSQL 16 with `psql`, SQL Server 2022 with `sqlcmd` an
 Database Free with SQL\*Plus. The last run used the current `--sql` text, with `exported_at`,
 and the current tool. Each query was saved in its own file and run with the procedure in the
 tables above, and nothing else was done to the output. Each schema used the table and column
-names above. It was filled with the self-test's fixture, including 1.8 million real delta rows
+names above. It was filled with the self-test's fixture, including 1.8 million synthetic delta rows
 across two versioned tables. It also held one `Sync Replica` item with a `<GPSyncReplica>`
 definition whose `ID` is `-1`.
 
@@ -669,9 +1003,18 @@ lineages export was deleted, the run exited 2 on all three DBMSs.
 The first live run found one defect. `sqlcmd` refused the replica query with Msg 1934, because `sqlcmd`
 connects with `QUOTED_IDENTIFIER` off and SQL Server refuses an XML `.value()` call under that
 setting. The query now sets `QUOTED_IDENTIFIER ON`, and an assertion pins it. Microsoft documents
-that SQL Server Management Studio connects with the setting on. SSMS was not part of the test.
+that an XML method needs the setting on, and that the ODBC and OLE DB drivers turn it on. SSMS was not
+part of the test, and no source is cited for its default.
 
 These were synthetic schemas, not geodatabases that ArcGIS created. See Limits.
+
+The two queries added later, `state_parents` and `version_tree`, were run on PostgreSQL only.
+They ran with `psql --csv` in a throwaway PostgreSQL 16 container with no published port,
+against synthetic `sde_versions`, `sde_states` and `sde_state_lineages` tables. The tool then
+read the exports with a fixed `--as-of`. The stranded view and the unregister plan were
+identical, line for line, to the same runs on CSV files written directly. The SQL Server and
+Oracle versions of these two queries were not run. Each is the same SELECT on that DBMS's
+table names, and each carries `row_count`.
 
 ## Why the obvious version is wrong
 
@@ -760,9 +1103,21 @@ that has not synced for months holds the floor exactly as hard as a detached one
   directly may leave out `exported_at`. Ages are then measured from the newest timestamp in the
   rows. On a geodatabase where editing has stopped, that makes a stalled holder look young. The
   command line refuses a versions export without `exported_at` for this reason.
-- **Everything is read into memory.** One synthetic export had 1,501 versions, 11,501 states and
-  3,010,501 lineage rows. It took about 15 seconds on a Windows workstation, almost all of it
+- **Everything is read into memory.** One synthetic export had about 1,500 versions, 11,500 states and
+  3 million lineage rows. It took about 15 seconds on a Windows workstation, almost all of it
   spent reading the CSVs. The time grows with the number of rows.
+- **Stranded states are candidates.** The tool proves that no version reaches the state. It
+  does not prove that a lost save made it, and it does not prove that a compress deletes the
+  state's delta rows. Both are `UNVERIFIED` (see "Stranded sibling states").
+- **The unregister plan advises only.** It runs nothing. Its poll rule of 30 seconds, 3 polls
+  and 1,800 seconds is not from Esri. Esri documents Delete Version for traditional versions,
+  and whether it can address a replica system version is not documented. This tool did not
+  test it. Esri also says that several replicas can share one replica version, and the plan
+  matches a version to a replica by its `SYNC_` name only. A shared version under another name
+  is not seen.
+- **The version nesting in the plan's fixture is synthetic.** Esri does not document how
+  replica system versions nest. The plan reads the real nesting from your `version_tree`
+  export.
 - **Nothing is fixed.** The tool names the holders. Deleting a version, re-syncing a replica or
   removing a detached replica version is a change that somebody signs for. Follow TA 000011719
   for a version the tool calls detached, and do not delete any other replica system version.
@@ -772,6 +1127,52 @@ that has not synced for months holds the floor exactly as hard as a detached one
   every row cannot be told from an empty table. A `--replicas` export like that makes every
   `SYNC_` version detached, so check that the replica query really returned nothing before you
   act on it.
+- **A deltas export with a header and no rows is not clean.** With `--state-parents`, the tool
+  exits 2 when stranded states exist and the deltas export holds no rows, because it cannot
+  tell which of them hold rows. Without `--state-parents`, a header-only deltas file is read as
+  zero rows, and the report says `delta rows compress cannot fold: 0`. Check that step 1 of
+  the deltas SQL returned lines before you run step 2.
+- **A stale export is reported as it was.** The tool does not compare `exported_at` with the
+  current time. If your export step fails and leaves last month's files, a daily monitor
+  reports on the old data and can exit 0. Check the file dates in the monitor.
+- **A stranded state is a candidate only.** Undone or abandoned work can leave the same shape
+  as a lost save, and a stranded state is a blocker whatever its age. A nightly monitor can
+  therefore exit 1 on candidate evidence. `--exit-on never` or `--exit-on any` lets you choose
+  how loudly it alerts. Without `--state-parents`, the stranded view is absent: an orphaned
+  state shows only as `ORPHANED_STATES`, and under the age limit it exits 0.
+- **Exports must be UTF-8.** A UTF-16 file, which is what a Windows PowerShell 5.1 `>`
+  redirect writes, or an ANSI file exits 2 with a decode error. Save with `-Encoding utf8` or
+  the client's UTF-8 option. The error names a byte and a position, not the content.
+- **`--report` overwrites the file it names.** With `--apply` it writes without asking, so
+  never point it at an export. The tool does not compare the report path with the input paths.
+- **A file that starts with `[` or `{` is read as JSON.** A CSV whose first header starts with
+  one of those characters exits 2.
+- **`--as-of ""` counts as not given.** An unset shell variable there silently uses the
+  export's `exported_at`.
+- **A numeric cell is read the way Python reads an integer.** A spreadsheet-edited value such
+  as `1_0` is read as 10, non-ASCII digits are accepted, and so is a leading `+`. `SYNC_`
+  names are matched with `\d`, which also matches non-ASCII digits. A negative `delta_rows` is
+  accepted and summed. A SQL export never writes these.
+- **A state 0 row with a blank or `NULL` `parent_state_id` exits 2.** The code does not use
+  state 0's parent, but the cell is still converted to a number. Esri does not document the
+  value. Write -1 or 0 in the export if your database holds `NULL` there.
+- **A version named `default` in any case, owned by anyone but SDE, exits 2.** The tool counts
+  exactly one `DEFAULT` version and refuses the export otherwise.
+- **The plan prints a replica name as it is stored.** A quote character in the name is not
+  escaped, so read the `UnregisterReplica` line before you paste it into a Python window.
+  Step 1 of the deltas SQL joins table owner names into the generated query without quoting
+  them, so read the generated lines before you run step 2.
+- **A version that two replicas share is listed for dropping.** The plan matches a version to
+  a replica by its `SYNC_` name, so unregistering the first replica lists a version that a
+  second replica also uses.
+- **The drain-wait numbers are a starting point, not a rule.** They come from one operator.
+- **Some Esri Community claims were not re-read.** That most `GPSyncReplica` IDs are -1, and
+  that `SYNC_` versions kept a compress from reaching state 0, rest on the two threads listed
+  under Sources and are `UNVERIFIED` here.
+- **Some code changes do not change a verdict.** Mutation testing found operator changes that
+  the self-test cannot see. They affect only the row numbers in error messages, the
+  state the orphan view uses as a tip (every state in that lineage forks the same way), the order of lines the report sorts
+  again, and the numbering of plan steps.
 - Only `--report` is ever written, and only with `--apply`. `--self-test` writes its fixture to
   a temporary folder and removes it, and it writes no bytecode cache beside the script. The
   tool opens no socket and imports no network module.
@@ -802,20 +1203,31 @@ that has not synced for months holds the floor exactly as hard as a detached one
   and [in Oracle](https://pro.arcgis.com/en/pro-app/latest/help/data/geodatabases/manage-oracle/geodatabase-system-tables-oracle.htm):
   the table names for each DBMS.
 - [System tables of a geodatabase in SQL Server (10.1)](https://resources.arcgis.com/en/help/main/10.1/002q/002q00000080000000.htm):
-  the columns of `SDE_versions`, `SDE_states`, `SDE_state_lineages`, `GDB_REPLICALOG`,
+  the columns of `SDE_versions` (`version_id`, `parent_version_id`), `SDE_states` (`owner`,
+  `parent_state_id`), `SDE_state_lineages`, `GDB_REPLICALOG`,
   `SDE_mvtables_modified` and `SDE_table_registry`.
 - [ArcSDE versioning database schema (10.0)](https://help.arcgis.com/en/geodatabase/10.0/sdk/arcsde/concepts/versioning/dbschema/dbschema.htm):
-  the same tables, and the rule that SQL Server and PostgreSQL add the `sde_` prefix.
+  the same tables, and the rule that SQL Server and PostgreSQL add the `sde_` prefix. Its
+  `STATES` table has `owner` and `parent_state_id`, and it says that `parent_state_id` is
+  "redundant with the last value of the lineage list".
 - [Versioned tables in a geodatabase in SQL Server (10.2)](https://resources.arcgis.com/en/help/main/10.2/002q/002q0000007v000000.htm):
   the delta tables `a<registration_id>` and `d<registration_id>`, and their `SDE_STATE_ID` and
   `DELETED_AT` columns.
 - [XML column queries](https://desktop.arcgis.com/en/arcmap/latest/manage-data/using-sql-with-gdbs/xml-column-queries.htm)
   and [Example: Find domain owners using SQL](https://desktop.arcgis.com/en/arcmap/latest/manage-data/using-sql-with-gdbs/example-finding-domain-owners.htm):
   the `GDB_Items_vw` view in Oracle and the PostgreSQL `xpath()` form.
+- [Unregister Replica (Data Management)](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/unregister-replica.html):
+  the tool must be run as the replica owner or the geodatabase administrator, takes a replica name
+  (fully qualified) or a replica ID, does not delete the replica's version, and leaves a replica that
+  cannot synchronize.
+- [Delete a traditional version](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/delete-a-traditional-version.html)
+  and [Delete Version (Data Management)](https://pro.arcgis.com/en/pro-app/latest/tool-reference/data-management/delete-version.htm):
+  a geodatabase administrator who deletes a version deletes its descendant versions too.
 - [Compress (Data Management)](https://pro.arcgis.com/en/pro-app/latest/tool-reference/data-management/compress.htm)
   and [Replication and versioning](https://pro.arcgis.com/en/pro-app/latest/help/data/geodatabases/overview/replication-and-versioning.htm):
-  what compress removes, and why replica system versions need regular syncs for compress to be
-  effective.
+  what compress removes ("states not referenced by a version and redundant rows"), why replica
+  system versions need regular syncs for compress to be effective, and that several replicas
+  can share one replica version.
 - [How to remove orphans sync replicas?](https://community.esri.com/t5/geodatabase-questions/how-to-remove-orphans-sync-replicas/td-p/846395)
   (Esri Community): the `Sync Replica` item type, the `/GPSyncReplica/ID` and
   `/GPSyncReplica/ReplicaName` paths, and a listing where most IDs are `-1`.
@@ -846,7 +1258,8 @@ Other single-file tools in this portfolio that pair with this one:
   match a pattern, and prints a plan first. It does no reconcile, post or compress. After it
   deletes versions, run a compress, and then run compressfloor to see what still holds the
   floor. Before that compress, the deleted versions' states show here as `ORPHANED_STATES`.
-  Its default pattern is `%SYNC%`, which
-  also matches the `SYNC_SEND_` and `SYNC_RECEIVE_` replica system versions. Never prune those:
-  TA 000011719 warns that deleting a replica system version other than a detached one corrupts
-  the replica.
+  Its default pattern is `%SYNC%`, which matches
+  the `SYNC_SEND_` and `SYNC_RECEIVE_` replica system versions, and it refuses those anchors by
+  default (`--allow-replica-anchors` overrides that). That pairs with the unregister plan here.
+  Never prune a replica system version by hand either: TA 000011719 warns that deleting one
+  other than a detached one corrupts the replica.
