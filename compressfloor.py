@@ -40,8 +40,9 @@ deletes a version and never connects to a database.
 
 Exit codes: 0 no finding of the --exit-on level, 1 at least one, 2 the tool
 could not read its input or write its report. By default (--exit-on blocker) a
-finding is a blocker: a holder past the age limit, or a stranded state that
-holds delta rows. --exit-on any also counts a holder under the limit, and
+finding is a blocker: a stalled, detached or ancient version past the age
+limit (a detached replica version at any age), an orphaned lineage older than
+the limit, or a stranded state that holds delta rows at any age. --exit-on any also counts a holder under the limit, and
 --exit-on never turns every finding into exit 0 and keeps exit 2.
 The exports hold versions, not state locks: a connected session's lock on an
 old state can hold compress too, and this tool does not see it.
@@ -92,10 +93,11 @@ VERSION = "VERSION"
 # behaviour before the flag existed.
 EXIT_ON = ("blocker", "any", "never")
 
-# The unregister plan's drain wait. UnregisterReplica returns before the
-# replica's system versions are all released, and the poll count is the only
-# way to see the release end. These numbers came from one operator's run on
-# one geodatabase. No Esri page gives them: tune them to your own estate.
+# The unregister plan's drain wait. One operator saw UnregisterReplica leave
+# system versions that were released later; Esri documents only that the tool
+# does not delete the replica's version. UNVERIFIED. If the release happens,
+# the poll count is the way to see it end. These numbers came from that
+# operator's run on one geodatabase: tune them to your own estate.
 DRAIN_POLL_SECONDS = 30
 DRAIN_STABLE_POLLS = 3
 DRAIN_TIMEOUT_SECONDS = 1800
@@ -1016,6 +1018,14 @@ def describe(model, report):
     return out
 
 
+# One text for the report and the plan: a header-only replicas export gets the
+# same warning wherever a replica is called detached because of it.
+NO_REPLICA_ROWS = ("the replicas export has no rows at all. If this "
+                   "geodatabase has replicas, the export is incomplete "
+                   "and this is not a detached version: export it "
+                   "again before deleting anything")
+
+
 def describe_finding(model, f):
     """The lines for one finding."""
     kind, key = f["kind"], f["key"]
@@ -1064,10 +1074,7 @@ def describe_finding(model, f):
         if not model["replicas"]:
             # Unregistered replicas leave exactly this state, so it is not
             # refused. A copy step that dropped the item rows leaves it too.
-            body.append("the replicas export has no rows at all. If this "
-                        "geodatabase has replicas, the export is incomplete "
-                        "and this is not a detached version: export it "
-                        "again before deleting anything")
+            body.append(NO_REPLICA_ROWS)
     elif kind == UNRESOLVED and model["replicas"] is None:
         body.append("supply --replicas to tell a detached replica from a "
                     "stalled one")
@@ -1172,6 +1179,8 @@ def plan_unregister(model, report, ids):
             elif not found[0]["blocker"]:
                 warning = ("it is not a blocker: %s, within the %d day limit"
                            % (held(found[0]["age"]), report["max_age_days"]))
+        elif status[rid] == DETACHED_ID and not model["replicas"]:
+            warning = NO_REPLICA_ROWS
         entries.append({
             "id": rid, "status": status[rid], "warning": warning,
             "name": (model["replicas"].get(rid) or {}).get("name"),
@@ -2376,6 +2385,21 @@ def self_test():
           "the printed plan lists a later replica's child version before "
           "an earlier replica's parent version  <-- pinned defect")
 
+    # A header-only replicas export calls replica 56 DETACHED. The report
+    # warns that the export may be incomplete; the plan must too.
+    empty, _ = plan_of([56], dict(px, replicas=[]))
+    e_lines = describe_plan(empty)
+    check(empty["entries"][0]["status"] == DETACHED_ID
+          and ("  warning: " + NO_REPLICA_ROWS) in e_lines
+          and e_lines.index("  warning: " + NO_REPLICA_ROWS)
+          < e_lines.index("  1. Outside this tool: read Esri TA 000011719 and "
+                          "confirm no live replica owns this id."),
+          "a plan built from a replicas export with no rows warns that the "
+          "export may be incomplete, before any step  <-- pinned defect")
+    check(not any(NO_REPLICA_ROWS in l for l in p_lines),
+          "and a plan from a replicas export with rows carries no such "
+          "warning")
+
     check(parse_ids("56, 57") == [56, 57] and parse_ids("0") == [0],
           "an id list is digits separated by commas")
     for bad in ("", "all", "56,", "56,x", "-1", "56,-1", "5.0", "\u00b2", "\u0663", "56,56"):
@@ -2664,6 +2688,18 @@ def self_test():
         code, _, err = run(base + ["--replica-log", paths["replica_log"]])
         check(code == 2 and "--replica-log needs --replicas" in err,
               "a replica log without the replicas export exits 2")
+        for flag in ("--versions", "--states", "--lineages", "--replicas",
+                     "--replica-log", "--deltas", "--state-parents",
+                     "--version-tree", "--report"):
+            # An unset shell variable. Read as "flag not given", it dropped
+            # the export, and the exit code changed with it.
+            code, out, err = run(full + [flag, ""])
+            check(code == 2 and out == "" and flag + ": an empty string"
+                  in err, "%s \"\" exits 2, it is not 'flag not given'"
+                  "  <-- pinned defect" % flag)
+        code, _, err = run(full + ["--replicas", "", "--deltas", ""])
+        check(code == 2 and "--replicas, --deltas: an empty string" in err,
+              "two empty flags are both named")
         code, out, _ = run(base + ["--max-age-days", "0"])
         check(code == 1 and "VERDICT: " in out,
               "--max-age-days 0 is accepted  <-- pinned defect")
@@ -3368,7 +3404,14 @@ def _main(args):
         sys.stdout.write(SQL[args.sql])
         return 0
 
-    absent = [k for k in exports[:3] if not getattr(args, k)]
+    # "" is an unset shell variable. It must never read as "flag not given":
+    # a skipped export changes the verdict and the exit code.
+    blank = [k for k in exports + ("report",) if getattr(args, k) == ""]
+    if blank:
+        return fail("--%s: an empty string is not 'flag not given'. Is a "
+                    "shell variable unset?" % ", --".join(
+                        k.replace("_", "-") for k in blank))
+    absent = [k for k in exports[:3] if getattr(args, k) is None]
     if absent:
         return fail("--%s is required. --sql prints the SELECTs that "
                     "produce it." % ", --".join(absent))
@@ -3401,8 +3444,8 @@ def _main(args):
                     % args.as_of)
 
     try:
-        rows = dict((k, read_rows(getattr(args, k), k) if getattr(args, k)
-                     else None) for k in exports)
+        rows = dict((k, read_rows(getattr(args, k), k)
+                     if getattr(args, k) is not None else None) for k in exports)
         model = build(**rows)
         report = analyse(model, args.max_age_days, as_of)
     except (IOError, OSError, ValueError, csv.Error, InputError) as exc:

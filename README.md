@@ -21,7 +21,8 @@ This tool reads the exported results of those queries and does the reading.
 
 Three later additions use the same offline pattern. An `--exit-on` flag lets a daily monitor
 tell a finding from a failure. A stranded sibling-state view lists, before a compress, the
-states that hold rows no version reaches. A plan-only replica unregister orders the steps and
+unreferenced states that have a later state with the same parent and owner (other unreferenced
+states appear only as `ORPHANED_STATES`). A plan-only replica unregister orders the steps and
 never runs one. Each has its own section below.
 
 ```
@@ -145,6 +146,8 @@ PASS  a replica version with an ordinary child version is kept, and the floor do
 PASS  a version whose child stays is kept, and so is every ancestor of it in the drop set  <-- pinned defect
 PASS  drops are ordered deepest first across replicas, and each entry keeps that order  <-- pinned defect
 ...
+PASS  a plan built from a replicas export with no rows warns that the export may be incomplete, before any step  <-- pinned defect
+...
 PASS  the id list '' is refused  <-- pinned defect
 PASS  the id list 'all' is refused  <-- pinned defect
 PASS  the id list '56,' is refused  <-- pinned defect
@@ -188,6 +191,12 @@ PASS  any other failure of the tool exits 2, not 1  <-- pinned defect
 PASS  an age limit past what a timedelta holds exits 2  <-- pinned defect
 PASS  a name outside cp1252 prints escaped to a cp1252 stdout, not a crash  <-- pinned defect
 PASS  a replica log without the replicas export exits 2
+...
+PASS  --versions "" exits 2, it is not 'flag not given'  <-- pinned defect
+PASS  --replicas "" exits 2, it is not 'flag not given'  <-- pinned defect
+PASS  --version-tree "" exits 2, it is not 'flag not given'  <-- pinned defect
+PASS  --report "" exits 2, it is not 'flag not given'  <-- pinned defect
+PASS  two empty flags are both named
 PASS  --max-age-days 0 is accepted  <-- pinned defect
 PASS  --max-age-days 999999999 is accepted  <-- pinned defect
 PASS  a credential file passed as an export is not echoed  <-- pinned defect
@@ -234,10 +243,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-364 assertions, 0 failed
+376 assertions, 0 failed
 ```
 
-The full run prints all 364 assertions. The `...` lines are where this block is cut.
+The full run prints all 376 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -279,7 +288,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 364 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
+The same 376 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
 (Python 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -600,7 +609,8 @@ pins both cases. Rows are lost when a client returns only the first rows, such a
 1000 Rows" in SQL Server Management Studio. They are also lost when a spreadsheet saves only
 its first 1,048,576 rows, or when a grid is copied one page at a time. Every shipped SELECT
 therefore returns `COUNT(*) OVER () AS row_count`, the number of rows that the query produced,
-on each row.
+on each row. Step 1 of the deltas SQL only writes the lines of step 2 and is not an export, so
+it carries no `row_count`.
 
 A paged copy can also repeat one row and lose another, and the count then stays right. None of
 the state, version, lineage and replica item tables can hold one key twice, so a repeated key in
@@ -1150,7 +1160,8 @@ that has not synced for months holds the floor exactly as hard as a detached one
   change.
 - **A stale export is reported as it was.** The tool does not compare `exported_at` with the
   current time. If your export step fails and leaves last month's files, a daily monitor
-  reports on the old data and can exit 0. Check the file dates in the monitor.
+  reports on the old data and can exit 0 or 1. The monitor examples do not check export file
+  dates, so add that check.
 - **A stranded state is a candidate only.** Undone or abandoned work can leave the same shape
   as a lost save, and a stranded state is a blocker whatever its age. A nightly monitor can
   therefore exit 1 on candidate evidence. `--exit-on never` or `--exit-on any` lets you choose
@@ -1164,7 +1175,8 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **A file that starts with `[` or `{` is read as JSON.** A CSV whose first header starts with
   one of those characters exits 2.
 - **`--as-of ""` counts as not given.** An unset shell variable there silently uses the
-  export's `exported_at`.
+  export's `exported_at`. Every export flag and `--report` given as `""` exits 2 instead, and
+  names the flag.
 - **A numeric cell is read the way Python reads an integer.** A spreadsheet-edited value such
   as `1_0` is read as 10, non-ASCII digits are accepted, and so is a leading `+`. `SYNC_`
   names are matched with `\d`, which also matches non-ASCII digits. A negative `delta_rows` is
@@ -1301,18 +1313,21 @@ that has not synced for months holds the floor exactly as hard as a detached one
   `0 failed` footer as a failure.
 - **A decimal id past 9,007,199,254,740,992 loses precision.** A cell such as
   `9007199254740993.0` is read through a float and accepted as ...992. Real state ids are small.
-- **Do not pipe the report into a command that closes early.** `UNVERIFIED`: a broken pipe
-  inside `print()` is an error that the tool reports as exit 2, but this was found by reading
-  the code and was not run. If stdout cannot be flushed at exit, for example on a full disk,
+- **Do not pipe the report into a command that closes early.** A reader that closes the pipe
+  early (`--self-test | head -3`) made the tool exit 2 with an `OSError` message on Windows
+  Git Bash. No other host was tried. If stdout cannot be flushed at exit, for example on a full disk,
   Python itself exits 120. Write the report to a file with `--report` and read the file.
 - **A failing `--self-test` exits 1,** the same code a monitor reads as a finding. Read the
   `0 failed` footer.
 - **A CSV row with more cells than the header drops the extra cells** without a message. The
   verdict does not change.
 - **That unregistering leaves system versions that drain over time is not documented by
-  Esri.** It comes from one operator's runs, and the plan treats it as `UNVERIFIED`.
-- **The `DROP ORDER` list also names versions of replicas that are still registered.** Read
-  the plan top to bottom. Drop none of those versions before that replica is unregistered and
+  Esri.** Esri documents only that the tool does not delete the replica's version. The wait
+  step in the plan rests on one operator's observation, and the plan treats it as
+  `UNVERIFIED`.
+- **The `DROP ORDER` list also names versions of replicas that are still registered, and
+  does not mark which ones.** Read the replica sections above it first, and read the plan top
+  to bottom. Drop none of those versions before that replica is unregistered and
   the exports are taken again.
 - **The `QUOTED_IDENTIFIER` fix is cited, but its `sqlcmd` default is not.** Microsoft's page
   (see Sources) says the setting must be ON to invoke XML methods and names the Native Client
@@ -1325,6 +1340,27 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **More mutations change no verdict.** The `if v is default: continue` line in `analyse()` is
   redundant. The `holds_floor` field on stranded findings is never read. The self-test cannot
   see them, and they change no verdict.
+- **Three kinds of version and one kind of unreferenced lineage make up the four findings.**
+  The story counts the versions; `ORPHANED_STATES` is the lineage no version references.
+- **The timestamp zone is checked for PostgreSQL only.** `exported_at` comes from the database
+  session clock, and `creation_time` is whatever the geodatabase wrote. If a SQL Server or Oracle
+  geodatabase stores `creation_time` in another zone than the session clock, every age shifts by
+  the offset, and a state made within that offset exits 2 as earlier than the newest timestamp.
+  `UNVERIFIED` on both.
+- **The mutation results were produced with a harness that is not part of this repository.**
+  The equivalent mutants named above also include the start value of the plan's depth count,
+  which shifts every depth equally.
+- **A blank `parent_version_id` on a version other than DEFAULT is read as a second root.** The
+  tool does not check that DEFAULT is the only such row. A blanked cell in a `version_tree`
+  export silently removes that version's kept-child protection from the unregister plan, which
+  can then list a replica version for dropping while an ordinary version sits under it. A
+  real export is not expected to blank another version's cell, so only a damaged one should
+  do this.
+- **A CSV with a leading blank line exits 2** with a message that says the columns are
+  missing. Delete the blank line.
+- **A header-only `--replicas` export warns in the plan too.** The plan adds the same
+  incomplete-export warning to a DETACHED replica when the export holds no rows. It does not
+  stop the plan; read the warning before you drop anything.
 
 ## Sources
 
