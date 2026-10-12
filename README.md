@@ -148,6 +148,7 @@ PASS  the id list 'all' is refused  <-- pinned defect
 PASS  the id list '56,' is refused  <-- pinned defect
 PASS  the id list '56,x' is refused  <-- pinned defect
 PASS  the id list '-1' is refused  <-- pinned defect
+...
 PASS  the id list '5.0' is refused  <-- pinned defect
 PASS  the id list '\xb2' is refused  <-- pinned defect
 PASS  the id list '\u0663' is refused  <-- pinned defect
@@ -214,6 +215,7 @@ PASS  --sql --version-tree exits 2, not ignored  <-- pinned defect
 PASS  a real process exits 1 on blockers, 0 under never, 0 on a holder under the limit and 2 on a failure
 ...
 PASS  --state-parents without --deltas exits 2  <-- pinned defect
+...
 PASS  a header-only deltas export with the stranded view exits 2, not 0  <-- pinned defect
 ...
 PASS  the plan wrote no file and loaded no arcpy, pyodbc or socket module  <-- pinned defect
@@ -230,10 +232,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-355 assertions, 0 failed
+361 assertions, 0 failed
 ```
 
-The full run prints all 355 assertions. The `...` lines are where this block is cut.
+The full run prints all 361 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -275,7 +277,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 355 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
+The same 361 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
 (Python 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -534,7 +536,7 @@ esac
 This is a PowerShell version:
 
 ```powershell
-python compressfloor.py --versions versions.csv --states states.csv --lineages lineages.csv | Out-File floor.txt
+python compressfloor.py --versions versions.csv --states states.csv --lineages lineages.csv | Out-File -Encoding utf8 floor.txt
 switch ($LASTEXITCODE) {
     0       { "monitor: clean" }
     1       { "monitor: findings, see floor.txt" }
@@ -691,8 +693,9 @@ one of four statuses:
 For a `REGISTERED` replica that is not a blocker in the report, the plan adds a warning. The
 replica may be live. The allowlist is your decision, and the plan does not override it.
 
-**Drop order.** The version tree comes from `--version-tree`. The plan lists the versions
-children first, deepest first. A version whose child version is not in the drop set stays, and
+**Drop order.** The version tree comes from `--version-tree`. The plan ends with one
+`DROP ORDER` list for every replica in the allowlist, children first, deepest first. One list
+is needed because a version of one replica can be the child of a version of another. A version whose child version is not in the drop set stays, and
 so does every ancestor of it in the set. Esri says that when the geodatabase administrator
 deletes a version, its descendant versions are deleted too. A replica system version with an
 ordinary version under it is therefore never listed for dropping, because the drop would remove
@@ -727,19 +730,21 @@ replica 56 'parcels_to_web': REGISTERED
   2. Unregister it as the replica owner or the geodatabase administrator: UnregisterReplica(<geodatabase>, "parcels_to_web"). ...
   3. Esri says the tool does not delete the replica's version. Wait for the release to end: ...
   4. Export the tables again and run this plan again with the same list. ...
-  5. Versions of this replica in the exports now, children first. Drop only those still there at the last export.
-       drop 1: SYNC_RECEIVE_56_0 (owner SDE, state 17)
-       drop 2: SYNC_SEND_56_0 (owner SDE, state 17)
+  5. Versions of this replica in the exports now are numbered in the DROP ORDER list below. Drop only those still there at the last export.
 
 replica 57 'roads_to_web': REGISTERED
   ...
-  5. Versions of this replica in the exports now, children first. Drop only those still there at the last export.
-       drop 1: SYNC_SEND_57_0 (owner SDE, state 18)
+  5. Versions of this replica in the exports now are numbered in the DROP ORDER list below. Drop only those still there at the last export.
 
 replica 48: DETACHED
   1. Outside this tool: read Esri TA 000011719 and confirm no live replica owns this id.
-  2. Versions of this replica in the exports now, children first. Drop only those still there at the last export.
-       drop 1: SYNC_SEND_48_2 (owner SDE, state 50)
+  2. Versions of this replica in the exports now are numbered in the DROP ORDER list below. Drop only those still there at the last export.
+
+DROP ORDER (children first, deepest first, across every replica above)
+  drop 1: SYNC_RECEIVE_56_0 (owner SDE, state 17, replica 56)
+  drop 2: SYNC_SEND_48_2 (owner SDE, state 50, replica 48)
+  drop 3: SYNC_SEND_56_0 (owner SDE, state 17, replica 56)
+  drop 4: SYNC_SEND_57_0 (owner SDE, state 18, replica 57)
 
 Esri documents Delete Version for traditional versions. Whether it can address a replica system version is not documented, and this tool did not test it.
 ```
@@ -1103,9 +1108,10 @@ that has not synced for months holds the floor exactly as hard as a detached one
   directly may leave out `exported_at`. Ages are then measured from the newest timestamp in the
   rows. On a geodatabase where editing has stopped, that makes a stalled holder look young. The
   command line refuses a versions export without `exported_at` for this reason.
-- **Everything is read into memory.** One synthetic export had about 1,500 versions, 11,500 states and
-  3 million lineage rows. It took about 15 seconds on a Windows workstation, almost all of it
-  spent reading the CSVs. The time grows with the number of rows.
+- **Everything is read into memory.** A synthetic export of 1,500 versions, 11,496 states and
+  3.4 million lineage rows took 14.7 and 14.9 seconds in two runs (Python 3.13.2, Windows
+  workstation), almost all of it spent reading the CSVs. The generator is not in this
+  repository. The time grows with the number of rows.
 - **Stranded states are candidates.** The tool proves that no version reaches the state. It
   does not prove that a lost save made it, and it does not prove that a compress deletes the
   state's delta rows. Both are `UNVERIFIED` (see "Stranded sibling states").
@@ -1130,8 +1136,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **A deltas export with a header and no rows is not clean.** With `--state-parents`, the tool
   exits 2 when stranded states exist and the deltas export holds no rows, because it cannot
   tell which of them hold rows. Without `--state-parents`, a header-only deltas file is read as
-  zero rows, and the report says `delta rows compress cannot fold: 0`. Check that step 1 of
-  the deltas SQL returned lines before you run step 2.
+  zero rows. The report then says `delta rows compress cannot fold: 0 (the deltas export
+  holds no rows: check that step 1 of the deltas SQL returned lines)`. The exit code does not
+  change.
 - **A stale export is reported as it was.** The tool does not compare `exported_at` with the
   current time. If your export step fails and leaves last month's files, a daily monitor
   reports on the old data and can exit 0. Check the file dates in the monitor.
@@ -1186,6 +1193,64 @@ that has not synced for months holds the floor exactly as hard as a detached one
   name is printed with Python's `unicode_escape`, for example `\n` and `\x1b`. A name
   therefore cannot add a false `VERDICT` line to the report, or hide the real one in a
   terminal. The self-test pins this case.
+- **A detached replica version at DEFAULT's own state is a blocker with an odd VERDICT.** The
+  run exits 1. The VERDICT then says `will not fold past state N`, where N is DEFAULT's own
+  state, and the report also says that nothing in the version table holds the floor. Read the
+  finding, not the VERDICT, in this case.
+- **A Replica item with a blank name is planned with an empty name.** The plan prints
+  `UnregisterReplica(<geodatabase>, "")`. Pass the replica id instead.
+- **The stranded view can be slow.** It scans every sibling of every unreferenced state. A
+  service account that saved thousands of times from one parent state makes the run quadratic
+  in that count.
+- **A newest save is not stranded.** An unreferenced state that is its owner's newest save is
+  not stranded. Recently deleted work that has delta rows is therefore not a blocker until the
+  orphan age limit passes, and the VERDICT line does not say so.
+- **A deleted version can look stranded.** A deleted version leaves the same shape before the
+  next compress, when the same owner keeps a later version from the same parent state. Taken
+  before a compress, that state is a blocker with delta rows and exits 1 under the default
+  level. Export after the compress, or use `--exit-on never` for this view.
+- **Exports taken seconds apart can exit 2.** On a busy geodatabase, a state that is created
+  between two SELECTs makes the `exported_at` time earlier than the newest timestamp, and the
+  run exits 2. The run fails safe, but a nightly monitor can show repeated exit 2 until the
+  SELECTs run back to back.
+- **Trailing empty CSV columns exit 2.** A CSV that Excel padded with empty columns exits 2
+  with `two columns named alike (not shown)`. The run fails safe. Delete the empty columns.
+- **A NULL that `sqlcmd` writes as the text `NULL` exits 2.** This holds for `logdate`,
+  `sourceendgen`, `targetgen`, `creation_time` and `parent_version_id`. Only a blank cell is
+  read as missing, and only `psql` writes one. Replace `NULL` with a blank cell or a value
+  before the run. The same trap applies to the DEFAULT row of the `version_tree` export
+  (see the next item).
+- **The unregister plan needs a blank `parent_version_id` on the DEFAULT row.** Esri does not
+  document what DEFAULT stores there. A value such as `-1`, or the text `NULL` that `sqlcmd -W`
+  writes, makes the run exit 2. Blank that cell by hand. The plain report does not read this
+  export and is not affected.
+- **Report line endings differ by host.** `--report` on Windows writes CRLF line endings and
+  on POSIX it writes LF, so the same report is not byte-identical across hosts.
+- **A failed run keeps the old report.** The `--report` file is written in place and not
+  atomically. A run that exits 2 leaves the previous report at that path, and a crash while
+  writing can leave a truncated file. Read the exit code before the file.
+- **Match the verdict from the start of the line.** A version name is printed as written, and
+  only a newline and other unprintable characters are escaped. A name can hold the text
+  `VERDICT:`. Use `grep '^VERDICT'`, not a search for the word anywhere.
+- **Exports and reports hold account and version names.** The `.gitignore` does not exclude
+  them. Keep them outside a git clone, or add them to your own ignore list.
+- **On Windows PowerShell 5.1, a plain `Out-File` writes UTF-16.** The monitor example uses
+  `-Encoding utf8` for that reason. Without it, `grep` sees a garbled report.
+- **A device or a named pipe given as an export is read whole.** There is no size limit. Pass
+  regular files.
+- **The password prompt of SQL*Plus may land in the export.** `UNVERIFIED`: the recipe
+  `@versions.sql > versions.csv` prompts for a password when the connect string has none, and
+  this tool did not test where the prompt text goes. Use a wallet or an externally
+  authenticated connect string.
+- **An unreadable file is described by Python's error text.** `UnicodeDecodeError` names a
+  byte and a position, and `json.JSONDecodeError` names a line and a column. Neither quotes
+  the content of the file.
+- **A self-test wrapper must read the footer.** `main()` can return `None` when the harness is
+  wrong, and the self-test then prints nothing. A wrapper must treat exit 0 without the
+  `0 failed` footer as a failure.
+- **More mutations change no verdict.** The `if v is default: continue` line in `analyse()` is
+  redundant. The `holds_floor` field on stranded findings is never read. The self-test cannot
+  see them, and they change no verdict.
 
 ## Sources
 

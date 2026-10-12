@@ -623,7 +623,8 @@ def read_parents(model, rows):
                          "not hold the same states. Take every export in one "
                          "sitting.")
     for sid, (parent, _) in model["parents"].items():
-        # Esri does not say what state 0's own parent holds, so it is not read.
+        # Esri does not say what state 0's own parent holds, so it is
+        # converted to a number above but never used.
         if sid and parent not in model["states"]:
             raise InputError("state %d has parent %d, which the states export "
                              "does not hold" % (sid, parent))
@@ -966,8 +967,12 @@ def describe(model, report):
     else:
         out.append("  compress can fold edits into the base tables no "
                    "further than state %d" % report["floor"])
-    out.append("  delta rows compress cannot fold: %s"
-               % number(report["unfoldable"]))
+    out.append("  delta rows compress cannot fold: %s%s"
+               % (number(report["unfoldable"]),
+                  " (the deltas export holds no rows: check that step 1 of "
+                  "the deltas SQL returned lines)"
+                  if model["deltas"] is not None and not model["deltas"]
+                  else ""))
 
     # A stranded state is also inside an ORPHANED_STATES lineage. The two
     # answer different questions, so each has its own section and count.
@@ -1222,21 +1227,30 @@ def describe_plan(plan):
         else:
             steps = ["Outside this tool: read Esri TA 000011719 and confirm "
                      "no live replica owns this id."]
-        steps.append("Versions of this replica in the exports now, children "
-                     "first. Drop only those still there at the last export."
+        steps.append("Versions of this replica in the exports now are "
+                     "numbered in the DROP ORDER list below. Drop only "
+                     "those still there at the last export."
                      if e["order"] else
                      "No version of this replica can be dropped from the "
                      "exports now.")
         for n, text in enumerate(steps, 1):
             out.append("  %d. %s" % (n, text))
-        for n, (owner, vname) in enumerate(e["order"], 1):
-            out.append("       drop %d: %s (owner %s, state %d)"
-                       % (n, vname, owner, plan["states"][(owner, vname)]))
         for (owner, vname), (c_owner, c_name) in e["blocked"]:
             out.append("       kept: %s (owner %s) has child version %s.%s, "
                        "which is not dropped. Esri: deleting a version as the "
                        "geodatabase administrator deletes its descendant "
                        "versions too." % (vname, owner, c_owner, c_name))
+    # One list for every replica: a version of one replica can be the child
+    # of a version of another, so only the global order is leaf-first.
+    if plan["order"]:
+        owner_of = dict((k, e["id"]) for e in plan["entries"]
+                        for k in e["order"])
+        out.extend(["", "DROP ORDER (children first, deepest first, across "
+                    "every replica above)"])
+        for n, key in enumerate(plan["order"], 1):
+            out.append("  drop %d: %s (owner %s, state %d, replica %d)"
+                       % (n, key[1], key[0], plan["states"][key],
+                          owner_of[key]))
     out.extend(["", "Esri documents Delete Version for traditional versions. "
                 "Whether it can address a replica system version is not "
                 "documented, and this tool did not test it."])
@@ -1718,6 +1732,11 @@ def self_test():
           "limit." in text,
           "the clean verdict names the limit it used and claims only the "
           "exports  <-- pinned defect")
+    check([l for l in text.splitlines() if l.startswith("VERDICT")]
+          == ["VERDICT: nothing in the exports holds the floor past the 30 "
+              "day limit."] and "holds no rows" not in text,
+          "a clean report has that one VERDICT line and no blocker count  "
+          "<-- pinned defect")
     empty_times = build(**tree([("DEFAULT", "SDE", 0)],
                                [(0, 0, 0, "")], []))
     check(analyse(empty_times)["as_of"] == datetime.datetime(1970, 1, 1),
@@ -2064,6 +2083,12 @@ def self_test():
           and not any(line.startswith("VERDICT: nothing") for line in s_lines),
           "a stranded state with no rows says so, and the verdict counts "
           "only the one that holds rows")
+    check([l for l in s_lines if l.startswith("VERDICT")]
+          == ["VERDICT: 1 stranded state(s) hold delta rows that no version "
+              "reaches. The next compress removes states no version "
+              "references: extract the rows first."],
+          "a report with stranded blockers only has no blocker-count "
+          "VERDICT line  <-- pinned defect")
     check(gate(sr) == 1 and gate(sr, "never") == 0
           and gate(analyse(build(**dict(sx, deltas=[
               r for r in sx["deltas"] if r["STATE_ID"] != "7"])))) == 0,
@@ -2208,11 +2233,14 @@ def self_test():
           "1800 s. Esri gives no such numbers." in p_text,
           "the drain wait states its poll rule and says the numbers are not "
           "Esri's")
-    check("drop 1: SYNC_RECEIVE_56_0 (owner SDE, state 17)" in p_text
-          and "drop 2: SYNC_SEND_56_0 (owner SDE, state 17)" in p_text
+    check([l for l in p_lines if l.strip().startswith("drop ")]
+          == ["  drop 1: SYNC_RECEIVE_56_0 (owner SDE, state 17, replica 56)",
+              "  drop 2: SYNC_SEND_48_2 (owner SDE, state 50, replica 48)",
+              "  drop 3: SYNC_SEND_56_0 (owner SDE, state 17, replica 56)",
+              "  drop 4: SYNC_SEND_57_0 (owner SDE, state 18, replica 57)"]
           and "Outside this tool: read Esri TA 000011719" in p_text,
-          "the drops are numbered children first, and a detached replica "
-          "is sent to TA 000011719")
+          "the drops are one list numbered children first, and a detached "
+          "replica is sent to TA 000011719")
     check(p_text.index("replica 56") < p_text.index("replica 57")
           < p_text.index("replica 48"),
           "the entries follow the order of the allowlist")
@@ -2241,6 +2269,14 @@ def self_test():
           "a live replica and an empty one are planned with a warning, and "
           "an id nothing has is ABSENT")
     q_text = "\n".join(describe_plan(quiet70))
+    check(q_text.count("  warning: ") == 2
+          and "  warning: it is not a blocker: held for 0 day(s), within the "
+          "30 day limit" in q_text
+          and "  warning: its system versions hold nothing now: they sit at "
+          "DEFAULT's state, or it has none" in q_text
+          and "TA 000011719" not in q_text,
+          "the warnings are printed, and an ABSENT replica gets no step "
+          "list  <-- pinned defect")
     check("nothing to plan: no Replica item and no SYNC_ version has this "
           "id" in q_text
           and "No version of this replica can be dropped from the exports "
@@ -2259,8 +2295,10 @@ def self_test():
           "none of its versions is listed for dropping  <-- pinned defect")
     r_text = "\n".join(describe_plan(refused))
     check("not planned: no geodatabase replica has this id, and 1 sync "
-          "replica(s) exist" in r_text and "may be live" in r_text,
-          "and the plan says why")
+          "replica(s) exist" in r_text and "may be live" in r_text
+          and "TA 000011719" not in r_text,
+          "and the plan says why, and a REFUSED replica gets no step list "
+          "that leads to a drop  <-- pinned defect")
 
     # OLD_DESIGN (version 6) is a child of SYNC_SEND_48_2 (version 5).
     blocked, _ = plan_of([48], plan_fixture({"OLD_DESIGN": 5}))
@@ -2297,10 +2335,16 @@ def self_test():
                                               ("SDE", "SYNC_SEND_56_0")],
           "drops are ordered deepest first across replicas, and each entry "
           "keeps that order  <-- pinned defect")
+    check([l for l in describe_plan(deep) if l.strip().startswith("drop ")]
+          == ["  drop 1: SYNC_SEND_57_0 (owner SDE, state 18, replica 57)",
+              "  drop 2: SYNC_RECEIVE_56_0 (owner SDE, state 17, replica 56)",
+              "  drop 3: SYNC_SEND_56_0 (owner SDE, state 17, replica 56)"],
+          "the printed plan lists a later replica's child version before "
+          "an earlier replica's parent version  <-- pinned defect")
 
     check(parse_ids("56, 57") == [56, 57] and parse_ids("0") == [0],
           "an id list is digits separated by commas")
-    for bad in ("", "all", "56,", "56,x", "-1", "5.0", "\u00b2", "\u0663", "56,56"):
+    for bad in ("", "all", "56,", "56,x", "-1", "56,-1", "5.0", "\u00b2", "\u0663", "56,56"):
         raises(lambda: parse_ids(bad),
                "the id list %s is refused  <-- pinned defect" % ascii(bad),
                ValueError)
@@ -2322,6 +2366,9 @@ def self_test():
           "a JSON null parent is a root")
     raises(lambda: build(**dict(px, version_tree=px["version_tree"][1:])),
            "a version_tree export that lacks a version is refused")
+    raises(lambda: build(**dict(px, version_tree=px["version_tree"][:-1])),
+           "a version_tree export that lacks a leaf version is refused, "
+           "though every parent link is held  <-- pinned defect")
     raises(lambda: build(**dict(px, version_tree=px["version_tree"]
                                 + px["version_tree"][:1])),
            "a version_tree export that repeats a version is refused  <-- "
@@ -2755,8 +2802,11 @@ def self_test():
               "a header-only deltas export with the stranded view exits 2, "
               "not 0  <-- pinned defect")
         code, out, err = run(sdel)
-        check(code == 0 and "delta rows compress cannot fold: 0" in out,
-              "and without --state-parents it is still read as zero rows")
+        check(code == 0 and "delta rows compress cannot fold: 0 (the deltas "
+              "export holds no rows: check that step 1 of the deltas SQL "
+              "returned lines)" in out,
+              "and without --state-parents it is read as zero rows, and the "
+              "report says the export held none  <-- pinned defect")
 
         # ---- the unregister plan, through the command line
         pdir = os.path.join(tmp, "plan")
