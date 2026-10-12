@@ -997,9 +997,15 @@ def describe(model, report):
     blockers = sum(1 for f in rest if f["blocker"])
     lost = sum(1 for f in strand if f["blocker"])
     out.append("")
-    if blockers:
+    # An orphaned lineage pins nothing: a compress removes it, so only a
+    # version-held blocker supports the "will not fold" prediction.
+    if blockers and any(f["blocker"] and f["kind"] != ORPHANED for f in rest):
         out.append("VERDICT: %d blocker(s). Compress will keep exiting 0 and "
                    "will not fold past state %d." % (blockers, report["floor"]))
+    elif blockers:
+        out.append("VERDICT: %d blocker(s), all orphaned states. Nothing "
+                   "pins the floor: the next compress removes them, so run "
+                   "one and export again." % blockers)
     if lost:
         out.append("VERDICT: %d stranded state(s) hold delta rows that no "
                    "version reaches. The next compress removes states no "
@@ -1614,6 +1620,16 @@ def self_test():
     check(kept_above["findings"] == [] and kept_above["floor"] == 5,
           "referenced, it holds nothing and the floor stays at DEFAULT's "
           "state")
+
+    only_orphan = build(**tree([("DEFAULT", "SDE", 5)], idle + [
+        (7, 7, 5, "")], [], None))
+    verdicts = [x for x in describe(only_orphan, analyse(
+        only_orphan, 30, datetime.datetime(2026, 9, 1)))
+        if x.startswith("VERDICT")]
+    check(len(verdicts) == 1 and "all orphaned states" in verdicts[0]
+          and "will not fold" not in verdicts[0],
+          "a run whose only blocker is an orphaned lineage does not predict "
+          "that compress will not fold  <-- pinned defect")
 
     lost = orphan((7, 7, 5, ""))
     check(lost["kind"] == ORPHANED and lost["blocker"] and lost["age"] is None,

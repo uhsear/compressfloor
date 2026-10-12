@@ -232,10 +232,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-361 assertions, 0 failed
+362 assertions, 0 failed
 ```
 
-The full run prints all 361 assertions. The `...` lines are where this block is cut.
+The full run prints all 362 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -277,7 +277,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 361 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
+The same 362 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
 (Python 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -370,9 +370,13 @@ the highest generation in those names and, with `--replica-log`, the last log ev
 highest generation it logged. A replica that has reached neither past generation 0 is described
 in those words.
 
-A holder under the age limit is listed in its own section and never fails the run. An edit
+A holder under the age limit is listed in its own section and, at the default level, never
+fails the run. `--exit-on any` makes it exit 1 (see "Exit codes for a daily monitor"). An edit
 version that is ten days old is normal work, and a tool that failed on it would be switched off
 within a week.
+
+When every blocker is an `ORPHANED_STATES` lineage, the VERDICT says so and does not predict
+that compress will not fold: the next compress removes those states.
 
 A detached replica version is a blocker at any age. Its replica no longer exists, so no sync
 will ever move it.
@@ -503,7 +507,7 @@ pins these three classifications and the header line.
 |---|---|
 | 0 | No finding at the `--exit-on` level. By default this means nothing in the exports holds the floor past the age limit. The exports do not show state locks, so this is not proof that nothing holds it (see Limits). |
 | 1 | At least one finding at that level. By default, a finding is a blocker. |
-| 2 | The tool could not do its job: an export could not be read or was a zero-byte file, the exports disagree with each other, a flag was wrong, `--as-of` is earlier than the exports, `--report` could not be written, or the tool itself hit an error. A header-only CSV or a JSON `[]` is read as zero rows, not as exit 2 (see Limits). |
+| 2 | The tool could not do its job: an export could not be read or was a zero-byte file, the exports disagree with each other, a flag was wrong, `--as-of` is earlier than the exports, `--report` could not be written, or the tool itself hit an error. A header-only CSV or a JSON `[]` is read as zero rows, and so not as exit 2, for only three exports: `--replicas`, `--replica-log` and `--deltas` (see Limits). An empty `--versions`, `--states`, `--lineages` or `--version-tree` export exits 2 for another reason: the exports no longer agree with each other. |
 
 Exit 2 is kept apart from exit 1 on purpose. A monitor that cannot read its input must never
 look like a monitor that found nothing, and it must never look like a finding either. Exit 2
@@ -1129,7 +1133,8 @@ that has not synced for months holds the floor exactly as hard as a detached one
   for a version the tool calls detached, and do not delete any other replica system version.
 - **A CSV export needs its header row.** A zero-byte file exits 2, and so does a header that
   lacks the export's columns, `row_count` included. A correct header with no data rows is read
-  as zero rows, and so is a JSON `[]`. No row then carries a `row_count`, so an export that lost
+  as zero rows, and so is a JSON `[]`, for `--replicas`, `--replica-log` and `--deltas` only. The
+  other exports exit 2 when they hold no rows. No row then carries a `row_count`, so an export that lost
   every row cannot be told from an empty table. A `--replicas` export like that makes every
   `SYNC_` version detached, so check that the replica query really returned nothing before you
   act on it.
@@ -1248,6 +1253,28 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **A self-test wrapper must read the footer.** `main()` can return `None` when the harness is
   wrong, and the self-test then prints nothing. A wrapper must treat exit 0 without the
   `0 failed` footer as a failure.
+- **A decimal id past 9,007,199,254,740,992 loses precision.** A cell such as
+  `9007199254740993.0` is read through a float and accepted as ...992. Real state ids are small.
+- **Do not pipe the report into a command that closes early.** `UNVERIFIED`: a broken pipe
+  inside `print()` is an error that the tool reports as exit 2, but this was found by reading
+  the code and was not run. If stdout cannot be flushed at exit, for example on a full disk,
+  Python itself exits 120. Write the report to a file with `--report` and read the file.
+- **A failing `--self-test` exits 1,** the same code a monitor reads as a finding. Read the
+  `0 failed` footer.
+- **A CSV row with more cells than the header drops the extra cells** without a message. The
+  verdict does not change.
+- **That unregistering leaves system versions that drain over time is not documented by
+  Esri.** It comes from one operator's runs, and the plan treats it as `UNVERIFIED`.
+- **The `DROP ORDER` list also names versions of replicas that are still registered.** Read
+  the plan top to bottom. Drop none of those versions before that replica is unregistered and
+  the exports are taken again.
+- **The `QUOTED_IDENTIFIER` fix is not linked to a Microsoft page.** The need for the setting
+  with an XML method is cited from memory of Microsoft documentation, and the `sqlcmd` default
+  of OFF is not cited. The self-test pins the SQL text, not the server's behaviour.
+- **The README's live database claims were not re-run for this version.** The three SQL blocks
+  equal the `--sql` output, but the PostgreSQL, SQL Server and Oracle container runs and the
+  `sqlcmd` Msg 1934 finding were run in earlier rounds only.
+- **Coverage on Linux was not measured.** Only the Windows run measured branch coverage.
 - **More mutations change no verdict.** The `if v is default: continue` line in `analyse()` is
   redundant. The `holds_floor` field on stranded findings is never read. The self-test cannot
   see them, and they change no verdict.
