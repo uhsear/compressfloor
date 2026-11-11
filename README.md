@@ -1082,6 +1082,9 @@ default.
 
 These were synthetic schemas, not geodatabases that ArcGIS created. See Limits.
 
+The `--deltas` step 1 and step 2 text was not part of those live runs. It was changed after
+them (marker rows and `tables_expected`), and only the SQLite stand-in ran the changed text.
+
 The two queries added later, `state_parents` and `version_tree`, were run on PostgreSQL only.
 They ran with `psql --csv` in a throwaway PostgreSQL 16 container with no published port,
 against synthetic `sde_versions`, `sde_states` and `sde_state_lineages` tables. The tool then
@@ -1229,9 +1232,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
   never point it at an export. The tool does not compare the report path with the input paths.
 - **A file that starts with `[` or `{` is read as JSON.** A CSV whose first header starts with
   one of those characters exits 2.
-- **`--as-of ""` counts as not given.** An unset shell variable there silently uses the
-  export's `exported_at`. Every export flag and `--report` given as `""` exits 2 instead, and
-  names the flag.
+- **An empty string exits 2.** An empty value for any export flag, `--report` or `--as-of`
+  exits 2 and names the flag, because an unset shell variable there must not read as "flag not
+  given".
 - **A numeric cell is read the way Python reads an integer.** A spreadsheet-edited value such
   as `1_0` is read as 10, non-ASCII digits are accepted, and so is a leading `+`. `SYNC_`
   names are matched with `\d`, which also matches non-ASCII digits. A negative `delta_rows` is
@@ -1299,13 +1302,15 @@ that has not synced for months holds the floor exactly as hard as a detached one
   hand.
 - **Timings come from a private generator** and were not reproduced from this repository.
 - **That compress still exits 0 is not sourced.** The story at the top rests on one operator's
-  runs. No page in Sources states the exit status of compress.
+  runs. No page in Sources states the exit status of compress. The claim that compress exits 0
+  while a version pins it rests on those runs alone.
 - **The VERDICT line states what compress will do as fact.** On a version-held blocker it
   prints that compress will not fold past state N. It no longer states an exit status. The tool
   cannot observe a state lock, so read that as what the exports show.
 - **Some Esri quotes come from older or archived pages.** The `parent_state_id` quote is from
   the ArcSDE 10.0 help page, a legacy source. TA 000011719 was read from an archived copy of
-  5 August 2021, not from Esri's live site.
+  5 August 2021, not from Esri's live site. The content of both technical articles was read in
+  an earlier round and was not re-checked for this version.
 - **On exit 2 the reason is on stderr, not in the report file.** The monitor examples send
   only stdout to `floor.txt`, so capture stderr too.
 - **Put no password on the `sqlcmd`, `psql` or `sqlplus` command line.** It lands in shell
@@ -1466,8 +1471,8 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **A closed stdout exits 2.** With `... | head -1` the write fails after the report was only
   partly read (`BrokenPipeError` on Linux, `OSError` on Windows). The exit code is then not a
   verdict.
-- **`LICENSE` and `.gitignore` use CRLF line endings, and the `.py` and README use LF.** A
-  `git` `autocrlf` setting can show a diff on checkout. It changes no behaviour.
+- **All four files are stored with LF endings in git.** On Windows with `core.autocrlf=true`,
+  `LICENSE` and `.gitignore` check out with CRLF endings. It changes no behaviour.
 
 - **The sqlcmd, psql and SQL\*Plus option behaviour and the PowerShell 5.1 UTF-16 default rest on
   earlier test runs, not on cited vendor pages.** Sources has no citation for the `sqlcmd` flags
@@ -1500,6 +1505,10 @@ that has not synced for months holds the floor exactly as hard as a detached one
   columns, not the line. Delete the `#TYPE System.Data.DataRow` line, or pass `-NoTypeInformation`.
 - **A `SYNC_` version name with more than 4300 digits exits 2** with Python's "Exceeds the limit
   (4300 digits) for integer string conversion", which does not name the export or the row.
+- **A replica-log row whose replica id is not in the replicas export is ignored** without a
+  message. The report and the exit code do not change.
+- **A versions export without `exported_at` exits 2 with a misleading count.** The message says
+  "0 other column(s)" when the export has no other column. Read the column names in the message.
 - **A header-only deltas export read without `--state-parents` prints `delta rows ... 0` lines
   as if measured.** Read the headline warning, not those lines: they mean "not counted".
 - **The self-test also leaves a short-lived file in the temp directory.** Python's `tempfile`
