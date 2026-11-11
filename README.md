@@ -60,6 +60,8 @@ PASS  only the unresolved replica versions are told to supply --replicas, and no
 PASS  a detached replica version at DEFAULT's own state is still a blocker  <-- pinned defect
 PASS  a detached verdict from a replicas export with no rows warns that the export may be incomplete  <-- pinned defect
 PASS  and a replicas export with rows carries no such warning
+PASS  a detached version at DEFAULT's own state is a blocker whose VERDICT does not predict that compress will not fold  <-- pinned defect
+PASS  a finding records whether its fork is below DEFAULT's own state
 PASS  and it is not said to hold a floor the header says nothing holds  <-- pinned defect
 PASS  a replica with a fresh SEND and an old RECEIVE forks at the older state and is STALLED
 PASS  and in the other row order too  <-- pinned defect
@@ -170,6 +172,7 @@ PASS  the disaster report is, line for line, the text the README quotes  <-- pin
 PASS  an --as-of before the exports exits 2, not a report of negative ages  <-- pinned defect
 ...
 PASS  a UTF-8 BOM is stripped from the first header  <-- pinned defect
+PASS  a UTF-16 export exits 2 and the message says to save it as UTF-8  <-- pinned defect
 PASS  a missing export exits 2, not 1  <-- pinned defect
 ...
 PASS  a JSON row with state_id twice (17,9000) exits 2, not a verdict picked by key order  <-- pinned defect
@@ -243,10 +246,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-376 assertions, 0 failed
+379 assertions, 0 failed
 ```
 
-The full run prints all 376 assertions. The `...` lines are where this block is cut.
+The full run prints all 379 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -288,7 +291,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 376 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
+The same 379 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
 (Python 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -389,13 +392,19 @@ within a week.
 When every blocker is an `ORPHANED_STATES` lineage, the VERDICT says so and does not predict
 that compress will not fold: the next compress removes those states.
 
+A detached replica version that sits at DEFAULT's own state holds nothing yet, so its VERDICT
+also does not predict that compress will not fold. It says that none pins the floor yet and
+names the detached version. The run still exits 1, because that version holds the floor as soon
+as DEFAULT takes its next edit.
+
 A detached replica version is a blocker at any age. Its replica no longer exists, so no sync
 will ever move it.
 
 A feature service replica is a different item, a `Sync Replica` item with a
 `<GPSyncReplica>` definition. One Esri Community thread under Sources shows a distributed
 collaboration that keeps `SYNC_SEND_` and `SYNC_RECEIVE_` versions. None of the Esri pages under Sources says which number those version names carry. In
-the one listing of `GPSyncReplica` items published on Esri Community, most had the `ID` `-1`.
+the one listing of `GPSyncReplica` items published on Esri Community, most had the `ID` `-1`
+(this was not confirmed from the thread text read here: `UNVERIFIED`).
 So when the replicas export holds any `Sync Replica`
 row, a `SYNC_` version that matches no `Replica` row is `UNRESOLVED_REPLICA_VERSION`, never
 detached. It is a blocker only when it has held the floor past the age limit. The report
@@ -1113,7 +1122,10 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **An offline map's replica version is an ordinary version here.** Esri names it
   `<user>_<service>_<ID>`, for example `Bob_NetFS_1404578882000`, with no `SYNC_` prefix. An
   old one is reported as `ANCIENT_VERSION`. Its device syncs through it, so do not delete it
-  until that device has removed the map and the version is reconciled and posted.
+  until that device has removed the map and the version is reconciled and posted. Esri's page
+  also names an anonymous form, `Esri_Anonymous_<feature service name>_<ID>`, and a shared
+  form without the ID. The tool reads both as ordinary versions too. The page says replica
+  versions can be reconciled, posted and deleted as downloaded maps are removed.
 - **Delta counts come from `SDE_mvtables_modified`.** Step 1 of the delta SQL lists only the
   tables that have a row there. A table with delta rows but no such row is not counted.
 - **One clock.** A `Z` or `+hh:mm` zone on a timestamp is ignored, because every timestamp comes
@@ -1170,7 +1182,7 @@ that has not synced for months holds the floor exactly as hard as a detached one
   state shows only as `ORPHANED_STATES`, and under the age limit it exits 0.
 - **Exports must be UTF-8.** A UTF-16 file, which is what a Windows PowerShell 5.1 `>`
   redirect writes, or an ANSI file exits 2 with a decode error. Save with `-Encoding utf8` or
-  the client's UTF-8 option. The error names a byte and a position, not the content.
+  the client's UTF-8 option. The error names the file and says to save it as UTF-8. It never quotes the content.
 - **`--report` overwrites the file it names.** With `--apply` it writes without asking, so
   never point it at an export. The tool does not compare the report path with the input paths.
 - **A file that starts with `[` or `{` is read as JSON.** A CSV whose first header starts with
@@ -1269,10 +1281,6 @@ that has not synced for months holds the floor exactly as hard as a detached one
   name is printed with Python's `unicode_escape`, for example `\n` and `\x1b`. A name
   therefore cannot add a false `VERDICT` line to the report, or hide the real one in a
   terminal. The self-test pins this case.
-- **A detached replica version at DEFAULT's own state is a blocker with an odd VERDICT.** The
-  run exits 1. The VERDICT then says `will not fold past state N`, where N is DEFAULT's own
-  state, and the report also says that nothing in the version table holds the floor. Read the
-  finding, not the VERDICT, in this case.
 - **A Replica item with a blank name is planned with an empty name.** The plan prints
   `UnregisterReplica(<geodatabase>, "")`. Pass the replica id instead.
 - **The stranded view can be slow.** It scans every sibling of every unreferenced state. A
@@ -1350,7 +1358,14 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **The README's live database claims were not re-run for this version.** The three SQL blocks
   equal the `--sql` output, but the PostgreSQL, SQL Server and Oracle container runs and the
   `sqlcmd` Msg 1934 finding were run in earlier rounds only.
-- **Coverage on Linux was not measured.** Only the Windows run measured branch coverage.
+- **Coverage on Linux was not measured.** Only the Windows run measured branch coverage, and
+  it counts in-process code only: the self-test's subprocess calls are not in the data.
+  `pyflakes` was run on Windows only.
+- **The Esri links under Sources will rot.** On 2026-11-10 the `pro.arcgis.com` Compress,
+  Replication and versioning, and Delete Version URLs answered with a 301 redirect to
+  `doc.esri.com`. Search for the page title if a link fails.
+- **In a JSON export, write names as strings.** A number `0` in a name column is read as a
+  blank name, not as the text `0`.
 - **More mutations change no verdict.** The `if v is default: continue` line in `analyse()` is
   redundant. The `holds_floor` field on stranded findings is never read. The self-test cannot
   see them, and they change no verdict.
@@ -1427,8 +1442,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
   (Esri Community): a distributed collaboration with no geodatabase replicas whose `SYNC_SEND`
   and `SYNC_RECEIVE` versions kept a compress from reaching state 0.
 - [Offline maps and traditional versioned data](https://enterprise.arcgis.com/en/server/latest/publish-services/windows/offline-maps-and-versioned-data.htm):
-  an offline map's replica version is named `<user>_<service>_<ID>`, and it is deleted only
-  after the map is removed from the device and the version is reconciled and posted.
+  an offline map's replica version is named `<user>_<service>_<ID>` (or
+  `Esri_Anonymous_<feature service name>_<ID>` on a site with no user accounts), and replica
+  versions can be reconciled, posted and deleted as downloaded maps are removed from devices.
 
 ## Contributing
 

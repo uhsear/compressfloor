@@ -821,7 +821,8 @@ def analyse(model, max_age_days=DEFAULT_MAX_AGE_DAYS, as_of=None):
         findings.append({
             "kind": kind or key[0], "blocker": kind is not None,
             "key": key, "versions": s["versions"], "fork": s["fork"],
-            "age": age, "holds_floor": holds and s["fork"] == floor,
+            "age": age, "holds": holds,
+            "holds_floor": holds and s["fork"] == floor,
             "generations": s["generations"],
             "weight": weight(model, s["private"])})
 
@@ -1003,11 +1004,21 @@ def describe(model, report):
     blockers = sum(1 for f in rest if f["blocker"])
     lost = sum(1 for f in strand if f["blocker"])
     out.append("")
-    # An orphaned lineage pins nothing: a compress removes it, so only a
-    # version-held blocker supports the "will not fold" prediction.
-    if blockers and any(f["blocker"] and f["kind"] != ORPHANED for f in rest):
+    # An orphaned lineage pins nothing: a compress removes it. A version at
+    # DEFAULT's own state pins nothing yet. Only a version that forks below
+    # DEFAULT supports the "will not fold" prediction.
+    pins = any(f["blocker"] and f["kind"] != ORPHANED and f["holds"]
+               for f in rest)
+    if pins:
         out.append("VERDICT: %d blocker(s). Compress will keep exiting 0 and "
                    "will not fold past state %d." % (blockers, report["floor"]))
+    elif blockers and any(f["kind"] != ORPHANED for f in rest
+                          if f["blocker"]):
+        out.append("VERDICT: %d blocker(s), none pins the floor yet. A "
+                   "version-held blocker sits at DEFAULT's own state and "
+                   "holds nothing until DEFAULT's next edit, and the next "
+                   "compress removes orphaned states. Delete the detached "
+                   "replica version(s) the finding names." % blockers)
     elif blockers:
         out.append("VERDICT: %d blocker(s), all orphaned states. Nothing "
                    "pins the floor: the next compress removes them, so run "
@@ -1539,6 +1550,15 @@ def self_test():
     check("no rows at all" not in "\n".join(describe(
         build(**fx), analyse(build(**fx)))),
           "and a replicas export with rows carries no such warning")
+    ry_verdicts = [x for x in describe(build(**young), ry)
+                   if x.startswith("VERDICT")]
+    check(len(ry_verdicts) == 1 and "none pins the floor yet" in ry_verdicts[0]
+          and "will not fold" not in ry_verdicts[0],
+          "a detached version at DEFAULT's own state is a blocker whose "
+          "VERDICT does not predict that compress will not fold  <-- pinned "
+          "defect")
+    check(not ry["findings"][0]["holds"] and by[(REPLICA, 56)]["holds"],
+          "a finding records whether its fork is below DEFAULT's own state")
     check("nothing in the version table holds the floor" in text
           and "this holds the floor" not in text
           and "at state 5, held for 0 day(s)" in text,
@@ -2544,6 +2564,15 @@ def self_test():
               "a UTF-8 BOM is stripped from the first header  <-- pinned "
               "defect")
 
+        utf16 = os.path.join(tmp, "utf16.csv")
+        with open(utf16, "w", newline="", encoding="utf-16") as handle:
+            handle.write("name,owner,state_id,exported_at,row_count\r\n")
+        code, _, err = run(["--versions", utf16] + base[2:])
+        check(code == 2 and "UTF-8" in err and "utf16.csv" in err
+              and "codec" not in err,
+              "a UTF-16 export exits 2 and the message says to save it as "
+              "UTF-8  <-- pinned defect")
+
         code, _, err = run(base[:4] + ["--lineages",
                                        os.path.join(tmp, "absent.csv")])
         check(code == 2 and "absent.csv" in err,
@@ -3296,8 +3325,14 @@ def read_rows(path, kind):
     file is what a failed export leaves behind, and read as "no replicas" it
     would call every live replica's system versions detached.
     """
-    with open(path, "r", newline="", encoding="utf-8-sig") as handle:
-        text = handle.read()
+    try:
+        with open(path, "r", newline="", encoding="utf-8-sig") as handle:
+            text = handle.read()
+    except UnicodeDecodeError:
+        raise InputError("%s is not UTF-8 text. A Windows PowerShell 5.1 "
+                         "redirect writes UTF-16: save the export as UTF-8 "
+                         "(-Encoding utf8, or the client's UTF-8 option)"
+                         % path)
     if text.lstrip()[:1] in ("[", "{"):
         rows = json.loads(text, object_pairs_hook=unique_keys)
         if not isinstance(rows, list) or not all(isinstance(r, dict)
