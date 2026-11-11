@@ -1005,8 +1005,9 @@ The article warns that the replica query in Oracle needs EXTPROC configured.
 
 All three dialects were run, exactly as printed by `--sql`, against a synthetic schema in a
 throwaway container: PostgreSQL 16 with `psql`, SQL Server 2022 with `sqlcmd` and Oracle
-Database Free with SQL\*Plus. The last run used the current `--sql` text, with `exported_at`,
-and the current tool. Each query was saved in its own file and run with the procedure in the
+Database Free with SQL\*Plus. The last run used the `--sql` text that carries `exported_at`. It did not use the
+current tool: the runs were made in earlier rounds, and the verdict code has changed since (see
+Limits). Each query was saved in its own file and run with the procedure in the
 tables above, and nothing else was done to the output. Each schema used the table and column
 names above. It was filled with the self-test's fixture, including 1.8 million synthetic delta rows
 across two versioned tables. It also held one `Sync Replica` item with a `<GPSyncReplica>`
@@ -1180,12 +1181,15 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **A numeric cell is read the way Python reads an integer.** A spreadsheet-edited value such
   as `1_0` is read as 10, non-ASCII digits are accepted, and so is a leading `+`. `SYNC_`
   names are matched with `\d`, which also matches non-ASCII digits. A negative `delta_rows` is
-  accepted and summed. A SQL export never writes these.
+  accepted and summed. A SQL export never writes these. A cell in scientific notation, such as
+  `3.37345E+06`, is read as the rounded whole number 3373450 without a message, so a
+  spreadsheet that rounded an id changes the id the tool reads.
 - **A state 0 row with a blank or `NULL` `parent_state_id` exits 2.** The code does not use
   state 0's parent, but the cell is still converted to a number. Esri does not document the
   value. Write -1 or 0 in the export if your database holds `NULL` there.
-- **A version named `default` in any case, owned by anyone but SDE, exits 2.** The tool counts
-  exactly one `DEFAULT` version and refuses the export otherwise.
+- **A versions export with two or more rows named `default` in any case exits 2,** whatever the
+  owner. The tool matches the name only and counts exactly one `DEFAULT` version. A single
+  `DEFAULT` owned by someone other than SDE, such as `dbo`, is accepted.
 - **The plan prints a replica name as it is stored.** A quote character in the name is not
   escaped, so read the `UnregisterReplica` line before you paste it into a Python window.
   Step 1 of the deltas SQL joins table owner names into the generated query without quoting
@@ -1226,7 +1230,16 @@ that has not synced for months holds the floor exactly as hard as a detached one
   item definition.
 - **The SQL Server and Oracle forms of the `state_parents` and `version_tree` queries have
   not been run.** Only the PostgreSQL forms were.
+- **The recipes need `psql` 12 or newer and SQL\*Plus 12.2 or newer.** `--csv` and
+  `SET MARKUP CSV` do not exist in older clients. The `sqlcmd` recipe writes names unquoted, so a
+  version or replica name that holds a comma splits its CSV row and the run exits 2 or reads the
+  wrong columns.
+- **A killed `--self-test` leaves its temporary folder behind.** The run removes the
+  `compressfloor-*` folder in the temp directory only when it ends normally. Delete leftovers by
+  hand.
 - **Timings come from a private generator** and were not reproduced from this repository.
+- **That compress still exits 0 is not sourced.** The story at the top rests on one operator's
+  runs. No page in Sources states the exit status of compress.
 - **The VERDICT line states what compress will do as fact.** On a version-held blocker it
   prints that compress will keep exiting 0 and will not fold past state N. The tool cannot
   observe a compress exit code or a state lock, so read that as what the exports show.
@@ -1276,8 +1289,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
   between two SELECTs makes the `exported_at` time earlier than the newest timestamp, and the
   run exits 2. The run fails safe, but a nightly monitor can show repeated exit 2 until the
   SELECTs run back to back.
-- **Trailing empty CSV columns exit 2.** A CSV that Excel padded with empty columns exits 2
-  with `two columns named alike (not shown)`. The run fails safe. Delete the empty columns.
+- **Two or more trailing empty CSV columns exit 2.** A CSV that Excel padded with two or more
+  empty columns exits 2 with `two columns named alike (not shown)`. The run fails safe. Delete
+  the empty columns. One trailing empty column is accepted.
 - **A NULL that `sqlcmd` writes as the text `NULL` exits 2.** This holds for `logdate`,
   `sourceendgen`, `targetgen`, `creation_time` and `parent_version_id`. Only a blank cell is
   read as missing, and only `psql` writes one. Replace `NULL` with a blank cell or a value

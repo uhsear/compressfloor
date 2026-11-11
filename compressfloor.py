@@ -42,7 +42,11 @@ Exit codes: 0 no finding of the --exit-on level, 1 at least one, 2 the tool
 could not read its input or write its report. By default (--exit-on blocker) a
 finding is a blocker: a stalled, detached or ancient version past the age
 limit (a detached replica version at any age), an orphaned lineage older than
-the limit, or a stranded state that holds delta rows at any age. --exit-on any also counts a holder under the limit, and
+the limit, or a stranded state that holds delta rows at any age. It is also a blocker
+when a replica version is UNRESOLVED (no replicas export, or a Sync Replica item
+beside it) and holds the floor past the limit, or when an orphaned lineage has
+no age.
+--exit-on any also counts a holder under the limit, and
 --exit-on never turns every finding into exit 0 and keeps exit 2.
 The exports hold versions, not state locks: a connected session's lock on an
 old state can hold compress too, and this tool does not see it.
