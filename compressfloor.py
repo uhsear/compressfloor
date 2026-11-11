@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """Name what holds an enterprise geodatabase's compress floor, from exported system tables.
 
-Compress on a traditionally versioned geodatabase exits 0 whether or not it got
-anywhere. It removes states no version references and folds edits common to
-every version into the base tables. One version that still points at an old
+Compress on a traditionally versioned geodatabase, in one operator's runs
+(UNVERIFIED: no cited page documents its exit status), exited 0 whether or not
+it got anywhere. It removes states no version references and folds edits common
+to every version into the base tables. One version that still points at an old
 state stops that fold at the state where it forked from DEFAULT, every night,
 with a success status. The version is often not a person's: a replica keeps
 hidden SYNC_ system versions, and a replica that was unregistered can leave
@@ -138,10 +139,19 @@ ROW_COUNT = "row_count"
 # replica would never cross the limit, and a nightly run would exit 0.
 EXPORTED_AT = "exported_at"
 
+# The deltas export is built by hand: the operator pastes the lines of step 1
+# into step 2. A line left out removes a whole table from the count, and a
+# stranded state whose rows sat in that table then reads as holding none. So
+# each step 1 line also writes one marker row with a negative state id (minus
+# the table's registration id), and step 2 repeats the number of tables the
+# registry lists under this name. build() refuses an export whose markers do
+# not match it, and stranded() refuses an export that carries no proof.
+TABLES_EXPECTED = "tables_expected"
+
 # The only header names an error message may echo. A wrong file passed by
 # mistake, such as a .env or a .pgpass, must never be printed to a job log.
 KNOWN_COLUMNS = set(c for columns in REQUIRED.values() for c in columns)
-KNOWN_COLUMNS.update((ROW_COUNT, EXPORTED_AT))
+KNOWN_COLUMNS.update((ROW_COUNT, EXPORTED_AT, TABLES_EXPECTED))
 
 # The read-only SELECTs that produce each export, per DBMS. Table and column
 # names are from Esri's geodatabase system table documentation; the GPReplica
@@ -198,11 +208,17 @@ SELECT 'UNION ALL SELECT sde_state_id, COUNT(*) FROM ' + r.owner + '.a'
        + CAST(r.registration_id AS varchar(12)) + ' GROUP BY sde_state_id'
        + ' UNION ALL SELECT deleted_at, COUNT(*) FROM ' + r.owner + '.d'
        + CAST(r.registration_id AS varchar(12)) + ' GROUP BY deleted_at'
+       + ' UNION ALL SELECT -' + CAST(r.registration_id AS varchar(12)) + ', 0'
 FROM sde.SDE_table_registry AS r
 WHERE r.registration_id IN (SELECT registration_id FROM sde.SDE_mvtables_modified);
 
 -- deltas.csv, step 2: put every line from step 1 above the last line, then run it
-SELECT state_id, delta_rows, COUNT(*) OVER () AS row_count FROM (
+SELECT state_id, delta_rows,
+       (SELECT COUNT(*) FROM sde.SDE_table_registry
+        WHERE registration_id IN
+              (SELECT registration_id FROM sde.SDE_mvtables_modified))
+           AS tables_expected,
+       COUNT(*) OVER () AS row_count FROM (
 SELECT NULL AS state_id, 0 AS delta_rows WHERE 1 = 0
 ) t;
 """,
@@ -254,11 +270,17 @@ SELECT 'UNION ALL SELECT sde_state_id, COUNT(*) FROM ' || r.owner || '.a'
        || r.registration_id || ' GROUP BY sde_state_id'
        || ' UNION ALL SELECT deleted_at, COUNT(*) FROM ' || r.owner || '.d'
        || r.registration_id || ' GROUP BY deleted_at'
+       || ' UNION ALL SELECT -' || r.registration_id || ', 0'
 FROM sde.sde_table_registry AS r
 WHERE r.registration_id IN (SELECT registration_id FROM sde.sde_mvtables_modified);
 
 -- deltas.csv, step 2: put every line from step 1 above the last line, then run it
-SELECT state_id, delta_rows, COUNT(*) OVER () AS row_count FROM (
+SELECT state_id, delta_rows,
+       (SELECT COUNT(*) FROM sde.sde_table_registry
+        WHERE registration_id IN
+              (SELECT registration_id FROM sde.sde_mvtables_modified))
+           AS tables_expected,
+       COUNT(*) OVER () AS row_count FROM (
 SELECT NULL::bigint AS state_id, 0::bigint AS delta_rows WHERE 1 = 0
 ) t;
 """,
@@ -310,11 +332,17 @@ SELECT 'UNION ALL SELECT sde_state_id, COUNT(*) FROM ' || r.owner || '.a'
        || r.registration_id || ' GROUP BY sde_state_id'
        || ' UNION ALL SELECT deleted_at, COUNT(*) FROM ' || r.owner || '.d'
        || r.registration_id || ' GROUP BY deleted_at'
+       || ' UNION ALL SELECT -' || r.registration_id || ', 0 FROM dual'
 FROM sde.TABLE_REGISTRY r
 WHERE r.registration_id IN (SELECT registration_id FROM sde.MVTABLES_MODIFIED);
 
 -- deltas.csv, step 2: put every line from step 1 above the last line, then run it
-SELECT state_id, delta_rows, COUNT(*) OVER () AS row_count FROM (
+SELECT state_id, delta_rows,
+       (SELECT COUNT(*) FROM sde.TABLE_REGISTRY
+        WHERE registration_id IN
+              (SELECT registration_id FROM sde.MVTABLES_MODIFIED))
+           AS tables_expected,
+       COUNT(*) OVER () AS row_count FROM (
 SELECT NULL AS state_id, 0 AS delta_rows FROM dual WHERE 1 = 0
 ) t;
 """,
@@ -478,7 +506,8 @@ def build(versions, states, lineages, replicas=None, replica_log=None,
 
     model = {"versions": [], "states": {}, "lineages": {}, "replicas": None,
              "sync_replicas": 0, "log": None, "deltas": None,
-             "exported_at": None, "parents": None, "tree": None}
+             "exported_at": None, "parents": None, "tree": None,
+             "delta_lines": 0, "delta_tables": None}
     for i, row in enumerate(states):
         sid = cell(row, "state_id", "states", i, to_int)
         if sid in model["states"]:
@@ -594,17 +623,43 @@ def build(versions, states, lineages, replicas=None, replica_log=None,
                     max(cell(row, "sourceendgen", "replica_log", i, to_int),
                         cell(row, "targetgen", "replica_log", i, to_int))))
     if deltas is not None:
-        model["deltas"] = {}
-        for i, row in enumerate(normalise(deltas, "deltas")):
-            sid = cell(row, "state_id", "deltas", i, to_int)
-            model["deltas"][sid] = (model["deltas"].get(sid, 0)
-                                    + cell(row, "delta_rows", "deltas", i,
-                                           to_int))
+        read_deltas(model, normalise(deltas, "deltas"))
     if state_parents is not None:
         read_parents(model, state_parents)
     if version_tree is not None:
         read_tree(model, version_tree)
     return model
+
+
+def read_deltas(model, rows):
+    """Sum delta rows per state, and check the export covers every table.
+
+    A row with a negative state id is a table marker, not a count. When the
+    export carries tables_expected, the markers must number exactly that.
+    """
+    model["deltas"] = {}
+    model["delta_lines"] = len(rows)
+    markers = 0
+    for i, row in enumerate(rows):
+        sid = cell(row, "state_id", "deltas", i, to_int)
+        count = cell(row, "delta_rows", "deltas", i, to_int)
+        if sid < 0:
+            markers += 1
+        else:
+            model["deltas"][sid] = model["deltas"].get(sid, 0) + count
+    if not rows or TABLES_EXPECTED not in rows[0]:
+        return
+    if len(set(str(r.get(TABLES_EXPECTED)).strip() for r in rows)) != 1:
+        raise InputError("deltas export does not say the same %s on every "
+                         "row. Export it again, whole." % TABLES_EXPECTED)
+    expected = cell(rows[0], TABLES_EXPECTED, "deltas", 0, to_int)
+    if markers != expected:
+        raise InputError(
+            "deltas export marks %d versioned table(s) and says %d exist. "
+            "Lines of step 1 were left out or pasted twice. Put every step "
+            "1 line above the last line of step 2, once, then export again."
+            % (markers, expected))
+    model["delta_tables"] = expected
 
 
 def read_parents(model, rows):
@@ -886,7 +941,7 @@ def stranded(model, lost, covered, trunk, as_of):
                 "fork": fork_of(model, sid, trunk)[0],
                 "age": age_of(model, sid, as_of), "holds_floor": False,
                 "weight": rows})
-    if out and not model["deltas"]:
+    if out and not model["delta_lines"]:
         # A header-only deltas file is what step 2 returns when the step 1
         # lines were left out. Read as "no rows anywhere" it would turn every
         # stranded blocker into a clean exit 0.
@@ -894,6 +949,13 @@ def stranded(model, lost, covered, trunk, as_of):
                          "view cannot say which stranded states hold delta "
                          "rows. Check that step 1 of the deltas SQL returned "
                          "lines, then export again.")
+    if out and model["delta_tables"] is None:
+        raise InputError("the deltas export has no %s column, so the tool "
+                         "cannot tell whether every step 1 line was pasted "
+                         "into step 2. A table left out hides its rows, and "
+                         "a stranded state would read as holding none. Run "
+                         "step 1 and step 2 from --sql again."
+                         % TABLES_EXPECTED)
     return out
 
 
@@ -978,7 +1040,7 @@ def describe(model, report):
                % (number(report["unfoldable"]),
                   " (the deltas export holds no rows: check that step 1 of "
                   "the deltas SQL returned lines)"
-                  if model["deltas"] is not None and not model["deltas"]
+                  if model["deltas"] is not None and not model["delta_lines"]
                   else ""))
 
     # A stranded state is also inside an ORPHANED_STATES lineage. The two
@@ -1010,8 +1072,8 @@ def describe(model, report):
     pins = any(f["blocker"] and f["kind"] != ORPHANED and f["holds"]
                for f in rest)
     if pins:
-        out.append("VERDICT: %d blocker(s). Compress will keep exiting 0 and "
-                   "will not fold past state %d." % (blockers, report["floor"]))
+        out.append("VERDICT: %d blocker(s). Compress will not fold past "
+                   "state %d." % (blockers, report["floor"]))
     elif blockers and any(f["kind"] != ORPHANED for f in rest
                           if f["blocker"]):
         out.append("VERDICT: %d blocker(s), none of them pins the floor yet. A "
@@ -1888,7 +1950,8 @@ def self_test():
     check("Esri TA 000011719" in joined,
           "a detached version cites the Esri procedure for removing it")
     check(joined.rstrip().endswith("will not fold past state 17."),
-          "the verdict says compress will keep exiting 0 and stop at 17")
+          "the verdict says compress will not fold past 17 and does not "
+          "state an exit status, which no cited page documents")
     check(joined.index("BLOCKERS (5)") < joined.index(
         "holding state but under the 30 day limit (3)"),
           "blockers are listed before holders under the limit")
@@ -1918,8 +1981,7 @@ def self_test():
     inj_lines = describe(inj, analyse(inj))
     check(all(line.isprintable() for line in inj_lines)
           and [line for line in inj_lines if line.startswith("VERDICT")]
-          == ["VERDICT: 5 blocker(s). Compress will keep exiting 0 and will "
-              "not fold past state 17."],
+          == ["VERDICT: 5 blocker(s). Compress will not fold past state 17."],
           "a version name holding newlines and an ANSI escape cannot forge a "
           "VERDICT line or hide one  <-- pinned defect")
     inj_text = "\n".join(inj_lines)
@@ -2280,6 +2342,37 @@ def self_test():
     raises(lambda: analyse(build(**fx_without(sx, "deltas"))),
            "the stranded view without a deltas export is refused: it counts "
            "rows  <-- pinned defect")
+    partial = [r for r in sx["deltas"] if r["STATE_ID"] != "-2"]
+    raises(lambda: build(**dict(sx, deltas=[
+        dict(r, TABLES_EXPECTED="2") for r in partial])),
+           "a deltas export that marks one of two versioned tables is "
+           "refused: the lines of the other were left out  <-- pinned "
+           "defect")
+    raises(lambda: build(**dict(sx, deltas=sx["deltas"] + sx["deltas"][-1:])),
+           "a deltas export that marks a table twice is refused")
+    raises(lambda: build(**dict(sx, deltas=[
+        dict(r, TABLES_EXPECTED="3") if r["STATE_ID"] == "7" else r
+        for r in sx["deltas"]])),
+           "a deltas export whose rows disagree on tables_expected is "
+           "refused")
+    raises(lambda: build(**dict(sx, deltas=[
+        dict(r, TABLES_EXPECTED="x") for r in sx["deltas"]])),
+           "a tables_expected cell that is not a number is refused")
+    bare = [dict((k, v) for k, v in r.items() if k != "TABLES_EXPECTED")
+            for r in sx["deltas"] if r["STATE_ID"][0] != "-"]
+    raises(lambda: analyse(build(**dict(sx, deltas=bare))),
+           "a deltas export without tables_expected is refused when "
+           "stranded candidates exist: a left-out table would read as zero "
+           "rows  <-- pinned defect")
+    check(not any(f["kind"] == STRANDED for f in analyse(build(**dict(
+        fx_without(sx, "state_parents"), deltas=bare)))["findings"]),
+          "the same export is accepted when no stranded view runs")
+    markers_only = analyse(build(**dict(sx, deltas=[
+        r for r in sx["deltas"] if r["STATE_ID"][0] == "-"])))
+    check(gate(markers_only) == 0 and "holds no rows" not in "\n".join(
+        describe(build(**sx), markers_only)),
+          "an export whose tables hold no delta rows is a measured zero, "
+          "not a missing export: stranded states are not blockers")
     raises(lambda: build(**dict(sx, state_parents=sx["state_parents"][1:])),
            "a state_parents export that lacks a state is refused")
     raises(lambda: build(**dict(sx, state_parents=sx["state_parents"]
@@ -2554,6 +2647,14 @@ def self_test():
               "the %s SQL counts the rows of all %d exports, so a lost row "
               "is caught" % (dbms, len(REQUIRED)))
 
+    for dbms in ("sqlserver", "postgresql", "oracle"):
+        step1, step2 = SQL[dbms].split("step 1:")[1].split(
+            "step 2:")
+        check(" UNION ALL SELECT -" in step1 and "AS tables_expected" in step2,
+              "the %s deltas SQL writes a marker per table and counts the "
+              "tables, so a left-out line is caught  <-- pinned defect"
+              % dbms)
+
     # sqlcmd connects with QUOTED_IDENTIFIER OFF, and SQL Server refuses an
     # XML .value() call under that setting (Msg 1934). The live sqlcmd run
     # of this query failed that way until the query set it.
@@ -2783,7 +2884,7 @@ def self_test():
               "a replica log without the replicas export exits 2")
         for flag in ("--versions", "--states", "--lineages", "--replicas",
                      "--replica-log", "--deltas", "--state-parents",
-                     "--version-tree", "--report"):
+                     "--version-tree", "--report", "--as-of"):
             # An unset shell variable. Read as "flag not given", it dropped
             # the export, and the exit code changed with it.
             code, out, err = run(full + [flag, ""])
@@ -2965,6 +3066,17 @@ def self_test():
               and "VERDICT" not in out,
               "a header-only deltas export with the stranded view exits 2, "
               "not 0  <-- pinned defect")
+        for label, text, words in (
+                ("partial", "state_id,delta_rows,tables_expected,row_count\n"
+                 "7,120,2,3\n8,3,2,3\n-1,0,2,3\n",
+                 "marks 1 versioned table(s) and says 2 exist"),
+                ("bare", "state_id,delta_rows,row_count\n7,120,1\n",
+                 "no tables_expected column")):
+            code, out, err = run(sargs[:7] + [export(
+                "deltas_%s.csv" % label, text)] + sargs[8:])
+            check(code == 2 and words in err and "VERDICT" not in out,
+                  "a %s deltas export with the stranded view exits 2, not "
+                  "0  <-- pinned defect" % label)
         code, out, err = run(sdel)
         check(code == 0 and "delta rows compress cannot fold: 0 (the deltas "
               "export holds no rows: check that step 1 of the deltas SQL "
@@ -3241,9 +3353,11 @@ def strand_fixture(states=STRAND_STATES, owners=STRAND_OWNERS,
     fx = fx_without(stamped(tree([("DEFAULT", "SDE", 5)], states,
                                  list(versions)), "2026-09-15 00:00:00"),
                     "replicas")
-    fx["deltas"] = [{"STATE_ID": str(s), "DELTA_ROWS": str(n)} for s, n in (
+    # -1 and -2 are the markers step 1 writes, one per versioned table.
+    fx["deltas"] = [{"STATE_ID": str(s), "DELTA_ROWS": str(n),
+                     "TABLES_EXPECTED": "2"} for s, n in (
         (7, 120), (8, 3), (9, 40), (11, 7), (13, 0), (14, 2), (17, 5),
-        (21, 1))]
+        (21, 1), (-1, 0), (-2, 0))]
     fx["state_parents"] = parents(states, owners)
     return fx
 
@@ -3336,8 +3450,7 @@ DISASTER_REPORT = [
     "      a compress removes states no version needs: if none has ru"
     "n since a version was deleted, run one and export again",
     "",
-    "VERDICT: 5 blocker(s). Compress will keep exiting 0 and will not"
-    " fold past state 17.",
+    "VERDICT: 5 blocker(s). Compress will not fold past state 17.",
 ]
 
 
@@ -3505,7 +3618,8 @@ def _main(args):
 
     # "" is an unset shell variable. It must never read as "flag not given":
     # a skipped export changes the verdict and the exit code.
-    blank = [k for k in exports + ("report",) if getattr(args, k) == ""]
+    blank = [k for k in exports + ("report", "as_of")
+             if getattr(args, k) == ""]
     if blank:
         return fail("--%s: an empty string is not 'flag not given'. Is a "
                     "shell variable unset?" % ", --".join(

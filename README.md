@@ -13,8 +13,8 @@ Compress does not fail when something pins it. It removes the states that no ver
 folds the edits that every version shares into the base tables, and then it stops. The point
 where it stops is the compress floor. Three kinds of version hold that floor: a replica that
 never syncs, a replica that was unregistered but left its system versions behind, and a
-forgotten edit version. Each holds it at the state where it forked from DEFAULT. Compress still
-exits 0.
+forgotten edit version. Each holds it at the state where it forked from DEFAULT. In that operator's
+runs compress still exited 0 (`UNVERIFIED`: no cited page documents its exit status).
 
 The operator diagnosed it by running three system-table queries by hand and reading the rows.
 This tool reads the exported results of those queries and does the reading.
@@ -255,10 +255,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-383 assertions, 0 failed
+396 assertions, 0 failed
 ```
 
-The full run prints all 383 assertions. The `...` lines are where this block is cut.
+The full run prints all 396 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -299,7 +299,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 383 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
+The same 396 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
 (Python 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -481,7 +481,7 @@ holding state but under the 30 day limit (3)
       delta rows in these states: 0
       a compress removes states no version needs: if none has run since a version was deleted, run one and export again
 
-VERDICT: 5 blocker(s). Compress will keep exiting 0 and will not fold past state 17.
+VERDICT: 5 blocker(s). Compress will not fold past state 17.
 ```
 
 Exit code 1. The ages differ from the state ages on purpose. Replica 56 forks at state 17, made
@@ -525,7 +525,7 @@ BLOCKERS (5)
       delta rows on its own branch: 0
       no geodatabase replica has this id, and 2 sync replica(s) exist, whose version ids Esri does not document. It may be one of them: do not delete it on TA 000011719's word
 ...
-VERDICT: 5 blocker(s). Compress will keep exiting 0 and will not fold past state 17.
+VERDICT: 5 blocker(s). Compress will not fold past state 17.
 ```
 
 The run still exits 1, and it still says that each replica never advanced past generation 0.
@@ -659,6 +659,12 @@ it at any time, so its age does not matter. A stranded state with no delta rows 
 is not a blocker. Every stranded state is also inside an `ORPHANED_STATES` lineage. The two
 answer different questions, so the report gives the stranded states their own section and count.
 Without `--state-parents`, nothing in the report changes.
+
+When stranded states exist, the deltas export must carry the `tables_expected` column and one
+marker row for each versioned table, as the shipped SQL writes them (see "The SQL"). A deltas
+export built from only some of the step 1 lines would otherwise give a stranded state zero rows
+and turn a blocker into a clean exit 0. The tool exits 2 when the markers do not match, and when
+the column is absent. The self-test pins both. An export with no stranded states needs neither.
 
 This is the synthetic fixture from the self-test, written out as CSV files. Its stranded states
 are 7 and 13. State 11 and state 21 are unreferenced too, but each is the newest state of its
@@ -830,6 +836,11 @@ that has edits in a state. Its output must be those lines alone, with no header 
 For step 2, make a file that holds the step 2 query. Put every line from step 1 above its last
 line, `) t;`. Run that file as in the first table, and save the result as `deltas.csv`.
 
+Each step 1 line also adds one marker row with a negative state id, which is minus the table's
+registration id. Step 2 also returns `tables_expected`, the number of tables that step 1 lists.
+The tool counts the marker rows and exits 2 when they differ from `tables_expected`. A line left
+out of step 2, or pasted twice, is therefore refused. It would otherwise hide a table's delta rows.
+
 An export saved from SQL Server Management Studio was not tested. If you use it, turn on
 "Include column headers when copying or saving the results" and "Quote strings containing list
 separators when saving .csv results" before you save.
@@ -886,11 +897,17 @@ SELECT 'UNION ALL SELECT sde_state_id, COUNT(*) FROM ' + r.owner + '.a'
        + CAST(r.registration_id AS varchar(12)) + ' GROUP BY sde_state_id'
        + ' UNION ALL SELECT deleted_at, COUNT(*) FROM ' + r.owner + '.d'
        + CAST(r.registration_id AS varchar(12)) + ' GROUP BY deleted_at'
+       + ' UNION ALL SELECT -' + CAST(r.registration_id AS varchar(12)) + ', 0'
 FROM sde.SDE_table_registry AS r
 WHERE r.registration_id IN (SELECT registration_id FROM sde.SDE_mvtables_modified);
 
 -- deltas.csv, step 2: put every line from step 1 above the last line, then run it
-SELECT state_id, delta_rows, COUNT(*) OVER () AS row_count FROM (
+SELECT state_id, delta_rows,
+       (SELECT COUNT(*) FROM sde.SDE_table_registry
+        WHERE registration_id IN
+              (SELECT registration_id FROM sde.SDE_mvtables_modified))
+           AS tables_expected,
+       COUNT(*) OVER () AS row_count FROM (
 SELECT NULL AS state_id, 0 AS delta_rows WHERE 1 = 0
 ) t;
 ```
@@ -948,11 +965,17 @@ SELECT 'UNION ALL SELECT sde_state_id, COUNT(*) FROM ' || r.owner || '.a'
        || r.registration_id || ' GROUP BY sde_state_id'
        || ' UNION ALL SELECT deleted_at, COUNT(*) FROM ' || r.owner || '.d'
        || r.registration_id || ' GROUP BY deleted_at'
+       || ' UNION ALL SELECT -' || r.registration_id || ', 0'
 FROM sde.sde_table_registry AS r
 WHERE r.registration_id IN (SELECT registration_id FROM sde.sde_mvtables_modified);
 
 -- deltas.csv, step 2: put every line from step 1 above the last line, then run it
-SELECT state_id, delta_rows, COUNT(*) OVER () AS row_count FROM (
+SELECT state_id, delta_rows,
+       (SELECT COUNT(*) FROM sde.sde_table_registry
+        WHERE registration_id IN
+              (SELECT registration_id FROM sde.sde_mvtables_modified))
+           AS tables_expected,
+       COUNT(*) OVER () AS row_count FROM (
 SELECT NULL::bigint AS state_id, 0::bigint AS delta_rows WHERE 1 = 0
 ) t;
 ```
@@ -1010,11 +1033,17 @@ SELECT 'UNION ALL SELECT sde_state_id, COUNT(*) FROM ' || r.owner || '.a'
        || r.registration_id || ' GROUP BY sde_state_id'
        || ' UNION ALL SELECT deleted_at, COUNT(*) FROM ' || r.owner || '.d'
        || r.registration_id || ' GROUP BY deleted_at'
+       || ' UNION ALL SELECT -' || r.registration_id || ', 0 FROM dual'
 FROM sde.TABLE_REGISTRY r
 WHERE r.registration_id IN (SELECT registration_id FROM sde.MVTABLES_MODIFIED);
 
 -- deltas.csv, step 2: put every line from step 1 above the last line, then run it
-SELECT state_id, delta_rows, COUNT(*) OVER () AS row_count FROM (
+SELECT state_id, delta_rows,
+       (SELECT COUNT(*) FROM sde.TABLE_REGISTRY
+        WHERE registration_id IN
+              (SELECT registration_id FROM sde.MVTABLES_MODIFIED))
+           AS tables_expected,
+       COUNT(*) OVER () AS row_count FROM (
 SELECT NULL AS state_id, 0 AS delta_rows FROM dual WHERE 1 = 0
 ) t;
 ```
@@ -1063,7 +1092,7 @@ table names, and each carries `row_count`.
 
 ## Why the obvious version is wrong
 
-**"Compress exits 0" is not a check.** Compress succeeds whenever it removes what it is allowed to
+**"Compress exits 0" is not a check.** In one operator's runs (`UNVERIFIED`: see Limits), compress succeeds whenever it removes what it is allowed to
 remove, even if that is nothing. Its success status says that it ran, not that it got anywhere.
 
 **A state count with a threshold alarms late and names nothing.** The count grows for months
@@ -1233,9 +1262,15 @@ that has not synced for months holds the floor exactly as hard as a detached one
   the self-test cannot see. They affect only the row numbers in error messages, the
   state the orphan view uses as a tip (every state in that lineage forks the same way), the order of lines the report sorts
   again, and the numbering of plan steps.
-- **A deltas export built from only some of the step 1 lines counts fewer rows.** A stranded
-  state whose rows were left out is then listed as not a blocker, and the run can exit 0. Only
-  a deltas file with no rows at all is refused.
+- **The deltas markers were run only on a SQLite stand-in.** The marker rows and the
+  `tables_expected` column of the three deltas queries are checked as text in the self-test. The
+  PostgreSQL text, with its `::bigint` casts removed, was run on SQLite against a synthetic
+  registry, and the three tables gave three markers and `tables_expected` 3. The Docker daemon
+  was not running, so the live PostgreSQL, SQL Server and Oracle runs were not repeated, and
+  the SQL Server and Oracle text of the markers has not run on those engines.
+- **A deltas export that was edited by hand can carry a false proof.** The tool trusts the
+  marker rows and `tables_expected` as they are written. Someone who adds a marker row, or
+  edits the column, defeats the check. It catches a left-out or repeated step 1 line, not tampering.
 - **Delta rows keyed to a state that is not in the states export are ignored** without a
   message. A deltas export taken at another moment than the states export can lower a weight
   silently.
@@ -1266,8 +1301,8 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **That compress still exits 0 is not sourced.** The story at the top rests on one operator's
   runs. No page in Sources states the exit status of compress.
 - **The VERDICT line states what compress will do as fact.** On a version-held blocker it
-  prints that compress will keep exiting 0 and will not fold past state N. The tool cannot
-  observe a compress exit code or a state lock, so read that as what the exports show.
+  prints that compress will not fold past state N. It no longer states an exit status. The tool
+  cannot observe a state lock, so read that as what the exports show.
 - **Some Esri quotes come from older or archived pages.** The `parent_state_id` quote is from
   the ArcSDE 10.0 help page, a legacy source. TA 000011719 was read from an archived copy of
   5 August 2021, not from Esri's live site.
@@ -1421,7 +1456,7 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **The opening story and the first paragraph of "Stranded sibling states" describe one
   operator's observations.** No Esri page states them.
 - **Branch coverage is 100 percent on Windows Python 3.13 and was not measured on Linux.** The
-  figure is 1,386 statements and 354 branches with none missed, from
+  figure is 1,420 statements and 368 branches with none missed, from
   `coverage run --branch compressfloor.py --self-test`.
 - **The fixture's replica ids and `SYNC_` names are copied from Esri's TA 000011719 example.**
   They are public Esri values, not data from any geodatabase.
@@ -1433,6 +1468,45 @@ that has not synced for months holds the floor exactly as hard as a detached one
   verdict.
 - **`LICENSE` and `.gitignore` use CRLF line endings, and the `.py` and README use LF.** A
   `git` `autocrlf` setting can show a diff on checkout. It changes no behaviour.
+
+- **The sqlcmd, psql and SQL\*Plus option behaviour and the PowerShell 5.1 UTF-16 default rest on
+  earlier test runs, not on cited vendor pages.** Sources has no citation for the `sqlcmd` flags
+  (`-W`, `-s`, `-h -1`, `SET NOCOUNT ON`), the `psql` `--csv` and `-A -t` flags, the SQL\*Plus
+  `SET MARKUP CSV` and `FEEDBACK` settings, or the Windows PowerShell 5.1 default for `Out-File`
+  and the `>` redirect.
+- **The descendant-version deletion rule comes from the "Delete a traditional version" page
+  only.** The Delete Version tool page does not repeat it.
+- **TA 000011719 identifies detached replica versions but does not say whether they hold the
+  compress floor.** Its replica SQL and its warning about other replica system versions were not
+  re-checked in the latest review, because the archived copy was not reachable.
+- **Run it as `python3 compressfloor.py`.** The shebang names `python`, which some Linux hosts
+  lack. Run directly there, the file exits 127, which a monitor reads as a failure, not a finding.
+- **The unregister plan prints a replica name raw inside `UnregisterReplica(<geodatabase>,
+  "NAME")`.** A name that holds a double quote or a closing bracket breaks the quoting of that
+  line, for example a replica named `x"); evil("`. Read the line before you paste it into a script.
+- **The report is text, not CSV.** The tool writes no CSV, so formula guarding does not apply. A
+  version name such as `=cmd|' /C calc'!A0` is printed as written, after a fixed label. Open the
+  report as text, not in a spreadsheet.
+- **Version, owner and replica names are echoed in several error messages,** for example
+  `versions export row N repeats version OWNER.NAME`. Only text columns are echoed, after
+  unprintable characters are escaped, and never a numeric or time cell. A wrong file that happens
+  to carry name and owner columns would print those cells to stderr.
+- **A very large lineages export is slow.** A 10-million-row export (1,000 versions forking from
+  a 20,000-state chain) took 55 seconds. The run was correct, so a nightly monitor needs a
+  timeout above that.
+- **Ctrl-C ends the run with a Python traceback.** `KeyboardInterrupt` is not caught, and the
+  exit code (130 or 1, not tested) can read as findings. Only a killed monitor sees it.
+- **A `#TYPE` first line from PowerShell `Export-Csv` exits 2.** The message names the missing
+  columns, not the line. Delete the `#TYPE System.Data.DataRow` line, or pass `-NoTypeInformation`.
+- **A `SYNC_` version name with more than 4300 digits exits 2** with Python's "Exceeds the limit
+  (4300 digits) for integer string conversion", which does not name the export or the row.
+- **A header-only deltas export read without `--state-parents` prints `delta rows ... 0` lines
+  as if measured.** Read the headline warning, not those lines: they mean "not counted".
+- **The self-test also leaves a short-lived file in the temp directory.** Python's `tempfile`
+  probes with a random zero-byte file and removes it, beside the `compressfloor-*` folder.
+- **The tool reports three kinds of version that hold a floor and one kind of unreferenced
+  lineage that holds none.** The holders are stalled or detached replica versions and old edit
+  versions. An orphaned lineage holds no floor, and TA 000011719 covers only the replica versions.
 
 ## Sources
 
