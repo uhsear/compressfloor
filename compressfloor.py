@@ -1017,8 +1017,19 @@ def describe(model, report):
         out.append("VERDICT: %d blocker(s), none pins the floor yet. A "
                    "version-held blocker sits at DEFAULT's own state and "
                    "holds nothing until DEFAULT's next edit, and the next "
-                   "compress removes orphaned states. Delete the detached "
-                   "replica version(s) the finding names." % blockers)
+                   "compress removes orphaned states. %s"
+                   % (blockers, "The replicas export has no rows, so "
+                      "export it again before you delete any version."
+                      if model["replicas"] is not None
+                      and not model["replicas"] else
+                      "Delete the detached replica version(s) the finding "
+                      "names."))
+    elif blockers and any(f["weight"] for f in rest if f["blocker"]):
+        out.append("VERDICT: %d blocker(s), all orphaned states. Nothing "
+                   "pins the floor, but some hold delta rows, and a compress "
+                   "may remove those rows: extract them first, then "
+                   "compress and export again."
+                   % blockers)
     elif blockers:
         out.append("VERDICT: %d blocker(s), all orphaned states. Nothing "
                    "pins the floor: the next compress removes them, so run "
@@ -1067,6 +1078,9 @@ def describe_finding(model, f):
         body = ["newest state %s; forks from DEFAULT's lineage at state %d"
                 % (days(f["age"]), f["fork"]),
                 "delta rows in these states: %s" % number(f["weight"]),
+                "a compress removes states no version needs, and may take "
+                "their delta rows with them: extract the rows first, then "
+                "export again" if f["weight"] else
                 "a compress removes states no version needs: if none has run "
                 "since a version was deleted, run one and export again"]
         return ["  %-26s %s" % (kind, head)] + ["      " + b for b in body]
@@ -1547,6 +1561,10 @@ def self_test():
           and "export it again before deleting anything" in text,
           "a detached verdict from a replicas export with no rows warns "
           "that the export may be incomplete  <-- pinned defect")
+    check("export it again before you delete any version" in text
+          and "Delete the detached replica" not in text,
+          "the verdict of a replicas export with no rows says to export "
+          "it again, never to delete a version  <-- pinned defect")
     check("no rows at all" not in "\n".join(describe(
         build(**fx), analyse(build(**fx)))),
           "and a replicas export with rows carries no such warning")
@@ -1692,6 +1710,15 @@ def self_test():
           and "run one and export again" in describe_finding(None, part)[-1],
           "an orphaned lineage says a compress must run before it is "
           "blamed on anything  <-- pinned defect")
+    rows = build(**dict(tree([("DEFAULT", "SDE", 5)], idle + [
+        (7, 7, 5, "")], [], None), deltas=[
+            {"STATE_ID": "7", "DELTA_ROWS": "40"}]))
+    rows_text = "\n".join(describe(rows, analyse(
+        rows, 30, datetime.datetime(2026, 9, 1))))
+    check("extract the rows first" in rows_text
+          and "run one and export again" not in rows_text,
+          "an orphaned lineage that holds delta rows is never told to run "
+          "a compress before the rows are extracted  <-- pinned defect")
     check(not orphan((7, 7, 5, "2026-08-02 00:00:00"))["blocker"],
           "an orphaned lineage exactly 30 days old is not a blocker")
     split = orphan((7, 7, 5, "2026-01-02 00:00:00"),
@@ -3253,8 +3280,8 @@ DISASTER_REPORT = [
     "      newest state 197 day(s) old; forks from DEFAULT's lineage "
     "at state 208",
     "      delta rows in these states: 1,760,000",
-    "      a compress removes states no version needs: if none has ru"
-    "n since a version was deleted, run one and export again",
+    "      a compress removes states no version needs, and may take t"
+    "heir delta rows with them: extract the rows first, then export again",
     "",
     "holding state but under the 30 day limit (3)",
     "  REPLICA                    replica 70 'assets_field'",

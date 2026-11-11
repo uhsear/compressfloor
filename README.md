@@ -246,10 +246,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-379 assertions, 0 failed
+381 assertions, 0 failed
 ```
 
-The full run prints all 379 assertions. The `...` lines are where this block is cut.
+The full run prints all 381 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -291,7 +291,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 379 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
+The same 381 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
 (Python 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -390,7 +390,9 @@ version that is ten days old is normal work, and a tool that failed on it would 
 within a week.
 
 When every blocker is an `ORPHANED_STATES` lineage, the VERDICT says so and does not predict
-that compress will not fold: the next compress removes those states.
+that compress will not fold: the next compress removes those states. If any of those states
+hold delta rows, the VERDICT tells you to extract the rows first, because no page read here
+says that a compress keeps them (see "Stranded sibling states").
 
 A detached replica version that sits at DEFAULT's own state holds nothing yet, so its VERDICT
 also does not predict that compress will not fold. It says that none pins the floor yet and
@@ -450,7 +452,7 @@ BLOCKERS (5)
   ORPHANED_STATES            lineage 300: 2 state(s) no version references, 300 to 301
       newest state 197 day(s) old; forks from DEFAULT's lineage at state 208
       delta rows in these states: 1,760,000
-      a compress removes states no version needs: if none has run since a version was deleted, run one and export again
+      a compress removes states no version needs, and may take their delta rows with them: extract the rows first, then export again
 
 holding state but under the 30 day limit (3)
   REPLICA                    replica 70 'assets_field'
@@ -1387,9 +1389,31 @@ that has not synced for months holds the floor exactly as hard as a detached one
   do this.
 - **A CSV with a leading blank line exits 2** with a message that says the columns are
   missing. Delete the blank line.
+- **A header-only `--replicas` export changes the VERDICT too.** When every blocker is a detached
+  replica version at DEFAULT's own state and the export has no rows, the VERDICT says to export
+  again and does not tell you to delete a version.
 - **A header-only `--replicas` export warns in the plan too.** The plan adds the same
   incomplete-export warning to a DETACHED replica when the export holds no rows. It does not
   stop the plan; read the warning before you drop anything.
+- **A `sqlcmd` export writes DEFAULT's empty `parent_version_id` as the text `NULL`.** The
+  shipped `version_tree` recipe then makes every `--unregister-plan` run exit 2 with "the value is
+  not a whole number", and the message does not say to blank the cell. Blank that cell by hand.
+  The run is fail-safe: it refuses and prints no plan.
+- **The opening story and the first paragraph of "Stranded sibling states" describe one
+  operator's observations.** No Esri page states them.
+- **Branch coverage is 100 percent on Windows Python 3.13 and was not measured on Linux.** The
+  figure is 1,378 statements and 352 branches with none missed, from
+  `coverage run --branch compressfloor.py --self-test`.
+- **The fixture's replica ids and `SYNC_` names are copied from Esri's TA 000011719 example.**
+  They are public Esri values, not data from any geodatabase.
+- **An orphaned lineage that holds no floor is listed under "holding state but under the N day
+  limit".** The heading names a version holder, so it is a label error for a lineage, not a
+  wrong verdict.
+- **A closed stdout exits 2.** With `... | head -1` the write fails after the report was only
+  partly read (`BrokenPipeError` on Linux, `OSError` on Windows). The exit code is then not a
+  verdict.
+- **`LICENSE` and `.gitignore` use CRLF line endings, and the `.py` and README use LF.** A
+  `git` `autocrlf` setting can show a diff on checkout. It changes no behaviour.
 
 ## Sources
 
