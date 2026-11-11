@@ -255,10 +255,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-400 assertions, 0 failed
+404 assertions, 0 failed
 ```
 
-The full run prints all 400 assertions. The `...` lines are where this block is cut.
+The full run prints all 404 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -299,7 +299,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 400 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
+The same 404 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
 (Python 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -1218,10 +1218,12 @@ that has not synced for months holds the floor exactly as hard as a detached one
   the replica query really returned nothing before you act on it.
 - **A deltas export with a header and no rows is not clean.** With `--state-parents`, the tool
   exits 2 when stranded states exist and the deltas export holds no rows, because it cannot
-  tell which of them hold rows. Without `--state-parents`, a header-only deltas file is read as
-  zero rows. The report then says `delta rows compress cannot fold: 0 (the deltas export
-  holds no rows: check that step 1 of the deltas SQL returned lines)`. The exit code does not
-  change.
+  tell which of them hold rows. Without `--state-parents`, a header-only deltas file counts as
+  no delta rows measured at all, the same as a missing `--deltas`. Every `delta rows` line then
+  says `not supplied`, an orphaned lineage keeps the "extract the rows first" advice, and the
+  report says `delta rows compress cannot fold: not supplied (the deltas export holds no rows:
+  check that step 1 of the deltas SQL returned lines)`. The wording "no delta counts were
+  supplied" also covers this case. The exit code does not change.
 - **A stale export is reported as it was.** The tool does not compare `exported_at` with the
   current time. If your export step fails and leaves last month's files, a daily monitor
   reports on the old data and can exit 0 or 1. The monitor examples do not check export file
@@ -1397,8 +1399,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
   `9007199254740993.0` is read through a float and accepted as ...992. Real state ids are small.
 - **Do not pipe the report into a command that closes early.** A reader that closes the pipe
   early (`--self-test | head -3`) made the tool exit 2 with an `OSError` message on Windows
-  Git Bash. No other host was tried. If stdout cannot be flushed at exit, for example on a full disk,
-  Python itself exits 120. Write the report to a file with `--report` and read the file.
+  Git Bash. The tool flushes stdout inside `main()` for this reason: an earlier version let
+  Python flush at exit, and Python then replaced the exit code with 120. Write the report to a
+  file with `--report --apply` and read the file.
 - **A failing `--self-test` exits 1,** the same code a monitor reads as a finding. Read the
   `0 failed` footer.
 - **A CSV row with more cells than the header drops the extra cells** without a message. The
@@ -1468,7 +1471,7 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **The opening story and the first paragraph of "Stranded sibling states" describe one
   operator's observations.** No Esri page states them.
 - **Branch coverage is 100 percent on Windows Python 3.13 and was not measured on Linux.** The
-  figure is 1,437 statements and 372 branches with none missed, from
+  figure is 1,473 statements and 372 branches with none missed, from
   `coverage run --branch compressfloor.py --self-test`.
 - **The fixture's replica ids and `SYNC_` names are copied from Esri's TA 000011719 example.**
   They are public Esri values, not data from any geodatabase.
@@ -1476,8 +1479,11 @@ that has not synced for months holds the floor exactly as hard as a detached one
   limit".** The heading names a version holder, so it is a label error for a lineage, not a
   wrong verdict.
 - **A closed stdout exits 2.** With `... | head -1` the write fails after the report was only
-  partly read (`BrokenPipeError` on Linux, `OSError` on Windows). The exit code is then not a
-  verdict.
+  partly read (`BrokenPipeError` on Linux, `OSError` on Windows). The tool flushes stdout before
+  it returns, prints `The report did not reach stdout` on stderr and exits 2, so the exit code
+  is not a verdict. It then points the standard output at the null device, so Python's exit
+  flush cannot fail again and turn the code into 120. A full disk at that flush is handled the
+  same way.
 - **All four files are stored with LF endings in git.** On Windows with `core.autocrlf=true`,
   `LICENSE` and `.gitignore` check out with CRLF endings. It changes no behaviour.
 
@@ -1503,8 +1509,10 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **The SQL Server replicas query calls `.value()` on `items.Definition` with no `CAST`.** Only
   synthetic schemas were run, so that column's type in a real geodatabase was not checked.
 - **The deltas SQL builds table names as owner + `.a` + registration id with no quoting.** An
-  owner whose name needs quoting makes step 2 fail with a SQL error, not a wrong answer. The step
-  is a SELECT only.
+  owner whose name needs quoting makes step 2 fail with a SQL error, not a wrong answer. Step 1
+  is a SELECT only, but you paste its output into step 2 as SQL. Read it first: an owner name
+  that holds a semicolon would run as SQL. Creating such an owner takes DBA rights. This was not
+  tested.
 - **`delta rows compress cannot fold` also counts delta rows in unreferenced states.** A compress
   removes those states, so some of that total is removed, not left in place.
 - **Run it as `python3 compressfloor.py`.** The shebang names `python`, which some Linux hosts
@@ -1532,13 +1540,41 @@ that has not synced for months holds the floor exactly as hard as a detached one
   message. The report and the exit code do not change.
 - **A versions export without `exported_at` exits 2 with a misleading count.** The message says
   "0 other column(s)" when the export has no other column. Read the column names in the message.
-- **A header-only deltas export read without `--state-parents` prints `delta rows ... 0` lines
-  as if measured.** Read the headline warning, not those lines: they mean "not counted".
+- **A header-only deltas export prints `delta rows ... not supplied`, not 0.** The wording says
+  "supplied" where the export was supplied and held no rows. Read the `deltas export holds no
+  rows` warning in the headline.
 - **The self-test also leaves a short-lived file in the temp directory.** Python's `tempfile`
   probes with a random zero-byte file and removes it, beside the `compressfloor-*` folder.
 - **The tool reports three kinds of version that hold a floor and one kind of unreferenced
   lineage that holds none.** The holders are stalled or detached replica versions and old edit
   versions. An orphaned lineage holds no floor, and TA 000011719 covers only the replica versions.
+- **The VERDICT line says a compress removes orphaned and stranded states as fact.** The
+  deletion of their delta rows is `UNVERIFIED`, and the finding itself says a compress "may take
+  their delta rows with them". The advice, extract the rows first, is the safe direction.
+- **Without `--state-parents`, exit 0 says nothing about stranded states.** The stranded view is
+  not computed, so states that may hold delta rows are not in the exit code.
+- **A young orphaned lineage is never a blocker.** It can hold delta rows that a compress would
+  remove. Exit 0 does not cover unreferenced rows younger than the age limit.
+- **The unregister plan does not use delta counts.** A version it lists for dropping can hold
+  private edits, and the plan gives no warning that dropping it loses them.
+- **A timestamp like `9/20/2026 1:58:10 AM` exits 2.** That is the `Export-Csv` default in
+  PowerShell. Format dates as `yyyy-MM-dd HH:mm:ss`.
+- **A states or replicas timestamp newer than `exported_at` exits 2.** Exports taken seconds
+  apart while people edit can do this, so a nightly monitor can see exit 2 during edits. Export
+  all files in one short step, when edits are quiet. `--as-of` cannot help: it may not be
+  earlier than the newest timestamp either.
+- **A deltas export without a `tables_expected` column is not checked for missing tables.** Only
+  the stranded view refuses such a file. A hand-built file can undercount an orphaned
+  lineage's rows.
+- **A closed descriptor (`>&-`) leaves no stdout.** The tool exits 2 with a message on stderr
+  and prints no report. Use `--report --apply`.
+- **The live Esri page may carry a newer title than the archived copy.** The archived 2021 copy
+  is titled "How To: Determine if there are detached replica system versions in the
+  geodatabase". The live address names the article with the word "orphaned". The steps and the
+  `Delete Version` and `sdeversion -o delete` sentence were read in the archived copy, and the
+  live page answered 403 to this tool's check.
+- **The opening story gives rounded counts** (a million delta rows, a thousand versions). They
+  are stand-ins, not measurements.
 
 ## Sources
 

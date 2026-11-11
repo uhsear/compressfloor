@@ -767,8 +767,13 @@ def fork_of(model, state_id, trunk):
 
 
 def weight(model, state_ids):
-    """Delta rows held in these states, or None when no --deltas was given."""
-    if model["deltas"] is None:
+    """Delta rows held in these states, or None when none were counted.
+
+    A header-only export counts nothing: it is what step 2 returns when the
+    step 1 lines were left out. Read as 0 it would drop the extract-first
+    advice before a compress that removes the rows.
+    """
+    if model["deltas"] is None or not model["delta_lines"]:
         return None
     return sum(model["deltas"].get(s, 0) for s in state_ids)
 
@@ -935,7 +940,7 @@ def stranded(model, lost, covered, trunk, as_of):
         if later:
             rows = weight(model, [sid])
             out.append({
-                "kind": STRANDED, "blocker": rows > 0,
+                "kind": STRANDED, "blocker": (rows or 0) > 0,
                 "key": (STRANDED, sid), "states": [sid], "parent": parent,
                 "owner": owner, "later": [(x, x in covered) for x in later],
                 "fork": fork_of(model, sid, trunk)[0],
@@ -3126,11 +3131,57 @@ def self_test():
                   "a %s deltas export with the stranded view exits 2, not "
                   "0  <-- pinned defect" % label)
         code, out, err = run(sdel)
-        check(code == 0 and "delta rows compress cannot fold: 0 (the deltas "
-              "export holds no rows: check that step 1 of the deltas SQL "
-              "returned lines)" in out,
-              "and without --state-parents it is read as zero rows, and the "
-              "report says the export held none  <-- pinned defect")
+        check(code == 0 and "delta rows compress cannot fold: not supplied "
+              "(the deltas export holds no rows: check that step 1 of the "
+              "deltas SQL returned lines)" in out,
+              "and without --state-parents it is read as not counted, and "
+              "the report says the export held no rows  <-- pinned defect")
+        code, out, _ = run(full[:-2] + ["--deltas", export(
+            "deltas_header_only.csv",
+            "state_id,delta_rows,tables_expected,row_count\n")])
+        verdict = [x for x in out.splitlines() if x.startswith("VERDICT")][0]
+        check(code == 1 and "delta rows in these states: not supplied" in out
+              and "delta rows in these states: 0" not in out
+              and "run one and export again" not in out
+              and "extract any rows first" in verdict,
+              "a header-only deltas export leaves an orphaned lineage's rows "
+              "not counted and keeps the extract-first advice  <-- pinned "
+              "defect")
+
+        # ---- a reader that closed the pipe
+        class Closed(io.StringIO):
+            def flush(self):
+                raise OSError(22, "Invalid argument")
+
+        err = io.StringIO()
+        with contextlib.redirect_stdout(Closed()), \
+                contextlib.redirect_stderr(err):
+            code = main(full)
+        check(code == 2 and "did not reach stdout" in err.getvalue(),
+              "a stdout that fails on flush exits 2, not the verdict  <-- "
+              "pinned defect")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(None), contextlib.redirect_stderr(err):
+            code = main(full)
+        check(code == 2 and "did not reach stdout" in err.getvalue(),
+              "a closed descriptor leaves no stdout at all and exits 2, "
+              "not with a traceback  <-- pinned defect")
+        pipe_r, pipe_w = os.pipe()
+        os.close(pipe_r)
+        pipe_out = io.TextIOWrapper(os.fdopen(pipe_w, "wb"),
+                                    encoding="utf-8")
+        with contextlib.redirect_stdout(pipe_out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = main(full)
+        drained = False
+        with contextlib.suppress(OSError):
+            pipe_out.flush()
+            drained = True
+        pipe_out.close()
+        check(code == 2 and drained,
+              "a pipe nobody reads exits 2, and its leftover buffer no "
+              "longer fails at exit, where Python would return 120  <-- "
+              "pinned defect")
 
         # ---- the unregister plan, through the command line
         pdir = os.path.join(tmp, "plan")
@@ -3640,12 +3691,34 @@ def main(argv=None):
         # hold any character. Escape it rather than crash mid-report.
         sys.stdout.reconfigure(errors="backslashreplace")
     try:
-        return _main(args)
+        code = _main(args)
     except Exception as exc:
         # Python exits 1 on an uncaught error, and 1 is the code a scheduler
         # reads as "blockers found". A failure of the tool is exit 2.
         return fail("%s: %s. This is a failure of the tool, not a finding."
                     % (type(exc).__name__, exc))
+    try:
+        # print() only fills a buffer. A reader that closed the pipe shows
+        # up here, not at interpreter exit, where Python turns it into 120.
+        sys.stdout.flush()
+    except (AttributeError, IOError, OSError, ValueError) as exc:
+        _drop_stdout(sys.stdout)
+        return fail("%s: %s. The report did not reach stdout, so the exit "
+                    "code is not a verdict. Write it with --report --apply."
+                    % (type(exc).__name__, exc))
+    return code
+
+
+def _drop_stdout(stream):
+    """Point a stream's descriptor at the null device.
+
+    Its buffer still holds the report. Python flushes it again at exit, and a
+    second failure there replaces the exit code with 120.
+    """
+    try:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), stream.fileno())
+    except (AttributeError, IOError, OSError, ValueError):
+        pass
 
 
 def _main(args):
