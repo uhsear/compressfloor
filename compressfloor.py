@@ -1014,7 +1014,7 @@ def describe(model, report):
                    "will not fold past state %d." % (blockers, report["floor"]))
     elif blockers and any(f["kind"] != ORPHANED for f in rest
                           if f["blocker"]):
-        out.append("VERDICT: %d blocker(s), none pins the floor yet. A "
+        out.append("VERDICT: %d blocker(s), none of them pins the floor yet. A "
                    "version-held blocker sits at DEFAULT's own state and "
                    "holds nothing until DEFAULT's next edit, and the next "
                    "compress removes orphaned states. %s"
@@ -1025,13 +1025,19 @@ def describe(model, report):
                       "Delete the detached replica version(s) the finding "
                       "names."))
     elif blockers and any(f["weight"] for f in rest if f["blocker"]):
-        out.append("VERDICT: %d blocker(s), all orphaned states. Nothing "
+        out.append("VERDICT: %d blocker(s), all orphaned states. No blocker "
                    "pins the floor, but some hold delta rows, and a compress "
                    "may remove those rows: extract them first, then "
                    "compress and export again."
                    % blockers)
+    elif blockers and any(f["weight"] is None for f in rest if f["blocker"]):
+        out.append("VERDICT: %d blocker(s), all orphaned states. No blocker "
+                   "pins the floor, but no delta counts were supplied, so "
+                   "these states may hold delta rows that a compress would "
+                   "remove: export them with --deltas and extract any rows "
+                   "first, then compress and export again." % blockers)
     elif blockers:
-        out.append("VERDICT: %d blocker(s), all orphaned states. Nothing "
+        out.append("VERDICT: %d blocker(s), all orphaned states. No blocker "
                    "pins the floor: the next compress removes them, so run "
                    "one and export again." % blockers)
     if lost:
@@ -1081,6 +1087,10 @@ def describe_finding(model, f):
                 "a compress removes states no version needs, and may take "
                 "their delta rows with them: extract the rows first, then "
                 "export again" if f["weight"] else
+                "a compress removes states no version needs, and may take "
+                "delta rows with them, but no delta counts were supplied: "
+                "export them with --deltas and extract any rows first, then "
+                "export again" if f["weight"] is None else
                 "a compress removes states no version needs: if none has run "
                 "since a version was deleted, run one and export again"]
         return ["  %-26s %s" % (kind, head)] + ["      " + b for b in body]
@@ -1570,7 +1580,7 @@ def self_test():
           "and a replicas export with rows carries no such warning")
     ry_verdicts = [x for x in describe(build(**young), ry)
                    if x.startswith("VERDICT")]
-    check(len(ry_verdicts) == 1 and "none pins the floor yet" in ry_verdicts[0]
+    check(len(ry_verdicts) == 1 and "none of them pins the floor yet" in ry_verdicts[0]
           and "will not fold" not in ry_verdicts[0],
           "a detached version at DEFAULT's own state is a blocker whose "
           "VERDICT does not predict that compress will not fold  <-- pinned "
@@ -1706,10 +1716,33 @@ def self_test():
     check(isinstance(part, dict) and part["blocker"] and part["age"] is None,
           "one undated state makes an orphaned lineage's age unknown, even "
           "beside a dated one  <-- pinned defect")
-    check(isinstance(part, dict)
-          and "run one and export again" in describe_finding(None, part)[-1],
-          "an orphaned lineage says a compress must run before it is "
-          "blamed on anything  <-- pinned defect")
+    zero = build(**dict(tree([("DEFAULT", "SDE", 5)], idle + [
+        (7, 7, 5, "")], [], None), deltas=[
+            {"STATE_ID": "7", "DELTA_ROWS": "0"}]))
+    zero_text = "\n".join(describe(zero, analyse(
+        zero, 30, datetime.datetime(2026, 9, 1))))
+    check("run one and export again" in zero_text
+          and "no delta counts were supplied" not in zero_text,
+          "an orphaned lineage with a counted weight of zero says a compress "
+          "must run before it is blamed on anything  <-- pinned defect")
+    check(isinstance(part, dict) and part["weight"] is None
+          and "run one and export again"
+          not in "\n".join(describe_finding(None, part))
+          and "no delta counts were supplied"
+          in describe_finding(None, part)[-1],
+          "an orphaned lineage with unknown delta rows is never told to run "
+          "a compress first, since that could delete them  <-- pinned defect")
+    unknown = "\n".join(describe(build(**tree(
+        [("DEFAULT", "SDE", 5)], idle + [(7, 7, 5, "")], [], None)),
+        analyse(build(**tree([("DEFAULT", "SDE", 5)], idle + [
+            (7, 7, 5, "")], [], None)), 30, datetime.datetime(2026, 9, 1))))
+    unknown_verdict = [x for x in unknown.splitlines()
+                       if x.startswith("VERDICT")]
+    check(len(unknown_verdict) == 1
+          and "no delta counts were supplied" in unknown_verdict[0]
+          and "run one" not in unknown_verdict[0],
+          "the VERDICT of all-orphaned blockers with no deltas export does "
+          "not say to compress first  <-- pinned defect")
     rows = build(**dict(tree([("DEFAULT", "SDE", 5)], idle + [
         (7, 7, 5, "")], [], None), deltas=[
             {"STATE_ID": "7", "DELTA_ROWS": "40"}]))

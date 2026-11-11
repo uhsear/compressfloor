@@ -59,6 +59,7 @@ PASS  a lineage export without its (lineage, 0) rows gives the same report  <-- 
 PASS  only the unresolved replica versions are told to supply --replicas, and no finding is told not to delete  <-- pinned defect
 PASS  a detached replica version at DEFAULT's own state is still a blocker  <-- pinned defect
 PASS  a detached verdict from a replicas export with no rows warns that the export may be incomplete  <-- pinned defect
+PASS  the verdict of a replicas export with no rows says to export it again, never to delete a version  <-- pinned defect
 PASS  and a replicas export with rows carries no such warning
 PASS  a detached version at DEFAULT's own state is a blocker whose VERDICT does not predict that compress will not fold  <-- pinned defect
 PASS  a finding records whether its fork is below DEFAULT's own state
@@ -76,7 +77,10 @@ PASS  a live collaboration replica a day behind is a holder, not a blocker  <-- 
 PASS  a state above DEFAULT on DEFAULT's own lineage is not DEFAULT's ancestor: unreferenced, it is orphaned  <-- pinned defect
 ...
 PASS  one undated state makes an orphaned lineage's age unknown, even beside a dated one  <-- pinned defect
-PASS  an orphaned lineage says a compress must run before it is blamed on anything  <-- pinned defect
+PASS  an orphaned lineage with a counted weight of zero says a compress must run before it is blamed on anything  <-- pinned defect
+PASS  an orphaned lineage with unknown delta rows is never told to run a compress first, since that could delete them  <-- pinned defect
+PASS  the VERDICT of all-orphaned blockers with no deltas export does not say to compress first  <-- pinned defect
+PASS  an orphaned lineage that holds delta rows is never told to run a compress before the rows are extracted  <-- pinned defect
 ...
 PASS  with the export time, the same replica has held the floor for 269 days and is a blocker  <-- pinned defect
 PASS  a blank exported_at is refused, never read as no export time  <-- pinned defect
@@ -196,7 +200,12 @@ PASS  a name outside cp1252 prints escaped to a cp1252 stdout, not a crash  <-- 
 PASS  a replica log without the replicas export exits 2
 ...
 PASS  --versions "" exits 2, it is not 'flag not given'  <-- pinned defect
+PASS  --states "" exits 2, it is not 'flag not given'  <-- pinned defect
+PASS  --lineages "" exits 2, it is not 'flag not given'  <-- pinned defect
 PASS  --replicas "" exits 2, it is not 'flag not given'  <-- pinned defect
+PASS  --replica-log "" exits 2, it is not 'flag not given'  <-- pinned defect
+PASS  --deltas "" exits 2, it is not 'flag not given'  <-- pinned defect
+PASS  --state-parents "" exits 2, it is not 'flag not given'  <-- pinned defect
 PASS  --version-tree "" exits 2, it is not 'flag not given'  <-- pinned defect
 PASS  --report "" exits 2, it is not 'flag not given'  <-- pinned defect
 PASS  two empty flags are both named
@@ -246,10 +255,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-381 assertions, 0 failed
+383 assertions, 0 failed
 ```
 
-The full run prints all 381 assertions. The `...` lines are where this block is cut.
+The full run prints all 383 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -262,7 +271,6 @@ The full run prints all 381 assertions. The `...` lines are where this block is 
   critical thresholds. It also prints the lineage row count and an "Orphaned States" count. A
   growing state count is a real early signal, and the script is easy to schedule. Its orphaned
   state count uses the query that "Why the obvious version is wrong" shows to be misleading.
-
 - **Esri's Unregister Replica and Delete Version tools.** The
   [Unregister Replica](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/unregister-replica.html)
   page says the tool does not delete the replica's version. The
@@ -291,7 +299,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 381 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
+The same 383 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
 (Python 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -392,11 +400,14 @@ within a week.
 When every blocker is an `ORPHANED_STATES` lineage, the VERDICT says so and does not predict
 that compress will not fold: the next compress removes those states. If any of those states
 hold delta rows, the VERDICT tells you to extract the rows first, because no page read here
-says that a compress keeps them (see "Stranded sibling states").
+says that a compress keeps them (see "Stranded sibling states"). Without a `--deltas` export the
+tool cannot tell, so the VERDICT and the finding say that no delta counts were supplied and tell
+you to export them and extract any rows first. Only a counted zero gets the advice to run a compress.
 
 A detached replica version that sits at DEFAULT's own state holds nothing yet, so its VERDICT
-also does not predict that compress will not fold. It says that none pins the floor yet and
-names the detached version. The run still exits 1, because that version holds the floor as soon
+also does not predict that compress will not fold. It says that none of the blockers pins the
+floor yet, which holds even when a version that is not a blocker holds the floor, and names the
+detached version. The run still exits 1, because that version holds the floor as soon
 as DEFAULT takes its next edit.
 
 A detached replica version is a blocker at any age. Its replica no longer exists, so no sync
@@ -1392,6 +1403,14 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **A header-only `--replicas` export changes the VERDICT too.** When every blocker is a detached
   replica version at DEFAULT's own state and the export has no rows, the VERDICT says to export
   again and does not tell you to delete a version.
+- **A header-only `--replicas` export exits 1, not 2.** The tool cannot tell a failed query from a
+  geodatabase with no replicas, so it reports the SYNC_ versions as detached and warns that the
+  export may be incomplete. A monitor reads exit 1 as a finding. Export again before you delete.
+- **Ages print as whole days, rounded down, but the age limit is compared to the exact time.** A
+  holder shown as 30 days old can be a blocker at `--max-age-days 30`.
+- **`--as-of` also accepts a `T` between the date and the time.**
+- **The report heading "holding state but under the 30 day limit" can list an orphaned lineage,**
+  which holds no state. Only the heading is loose; the verdict and the exit code are not affected.
 - **A header-only `--replicas` export warns in the plan too.** The plan adds the same
   incomplete-export warning to a DETACHED replica when the export holds no rows. It does not
   stop the plan; read the warning before you drop anything.
@@ -1402,7 +1421,7 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **The opening story and the first paragraph of "Stranded sibling states" describe one
   operator's observations.** No Esri page states them.
 - **Branch coverage is 100 percent on Windows Python 3.13 and was not measured on Linux.** The
-  figure is 1,378 statements and 352 branches with none missed, from
+  figure is 1,386 statements and 354 branches with none missed, from
   `coverage run --branch compressfloor.py --self-test`.
 - **The fixture's replica ids and `SYNC_` names are copied from Esri's TA 000011719 example.**
   They are public Esri values, not data from any geodatabase.
