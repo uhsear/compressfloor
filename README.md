@@ -255,10 +255,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-396 assertions, 0 failed
+400 assertions, 0 failed
 ```
 
-The full run prints all 396 assertions. The `...` lines are where this block is cut.
+The full run prints all 400 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -299,7 +299,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 396 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
+The same 400 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
 (Python 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -403,6 +403,10 @@ hold delta rows, the VERDICT tells you to extract the rows first, because no pag
 says that a compress keeps them (see "Stranded sibling states"). Without a `--deltas` export the
 tool cannot tell, so the VERDICT and the finding say that no delta counts were supplied and tell
 you to export them and extract any rows first. Only a counted zero gets the advice to run a compress.
+When a non-orphan blocker is also listed, the VERDICT keeps its own sentence about that blocker
+and adds the same extract-first advice for any orphaned blocker that holds, or may hold, delta
+rows. A VERDICT that predicts the floor therefore cannot be read as leave-to-compress when a
+lineage with delta rows is listed under it.
 
 A detached replica version that sits at DEFAULT's own state holds nothing yet, so its VERDICT
 also does not predict that compress will not fold. It says that none of the blockers pins the
@@ -481,7 +485,7 @@ holding state but under the 30 day limit (3)
       delta rows in these states: 0
       a compress removes states no version needs: if none has run since a version was deleted, run one and export again
 
-VERDICT: 5 blocker(s). Compress will not fold past state 17.
+VERDICT: 5 blocker(s). Compress will not fold past state 17. Orphaned states hold delta rows that a compress removes: extract the rows first.
 ```
 
 Exit code 1. The ages differ from the state ages on purpose. Replica 56 forks at state 17, made
@@ -525,7 +529,7 @@ BLOCKERS (5)
       delta rows on its own branch: 0
       no geodatabase replica has this id, and 2 sync replica(s) exist, whose version ids Esri does not document. It may be one of them: do not delete it on TA 000011719's word
 ...
-VERDICT: 5 blocker(s). Compress will not fold past state 17.
+VERDICT: 5 blocker(s). Compress will not fold past state 17. Orphaned states hold delta rows that a compress removes: extract the rows first.
 ```
 
 The run still exits 1, and it still says that each replica never advanced past generation 0.
@@ -1054,7 +1058,8 @@ The article warns that the replica query in Oracle needs EXTPROC configured.
 
 ### How the SQL was tested
 
-All three dialects were run, exactly as printed by `--sql`, against a synthetic schema in a
+The versions, states, lineages, replicas and replica log queries were run on all three
+dialects, exactly as `--sql` printed them at the time, against a synthetic schema in a
 throwaway container: PostgreSQL 16 with `psql`, SQL Server 2022 with `sqlcmd` and Oracle
 Database Free with SQL\*Plus. The last run used the `--sql` text that carries `exported_at`. It did not use the
 current tool: the runs were made in earlier rounds, and the verdict code has changed since (see
@@ -1083,7 +1088,8 @@ default.
 These were synthetic schemas, not geodatabases that ArcGIS created. See Limits.
 
 The `--deltas` step 1 and step 2 text was not part of those live runs. It was changed after
-them (marker rows and `tables_expected`), and only the SQLite stand-in ran the changed text.
+them (marker rows and `tables_expected`), and only the SQLite stand-in ran the changed text. The
+current `--deltas` text has never run on SQL Server or Oracle.
 
 The two queries added later, `state_parents` and `version_tree`, were run on PostgreSQL only.
 They ran with `psql --csv` in a throwaway PostgreSQL 16 container with no published port,
@@ -1309,8 +1315,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
   cannot observe a state lock, so read that as what the exports show.
 - **Some Esri quotes come from older or archived pages.** The `parent_state_id` quote is from
   the ArcSDE 10.0 help page, a legacy source. TA 000011719 was read from an archived copy of
-  5 August 2021, not from Esri's live site. The content of both technical articles was read in
-  an earlier round and was not re-checked for this version.
+  5 August 2021, not from Esri's live site. The `parent_state_id` page was read in an earlier
+  round. The TA 000011719 text was re-read on 2026-11-11 from the archived copy and matches the
+  claims made here.
 - **On exit 2 the reason is on stderr, not in the report file.** The monitor examples send
   only stdout to `floor.txt`, so capture stderr too.
 - **Put no password on the `sqlcmd`, `psql` or `sqlplus` command line.** It lands in shell
@@ -1461,7 +1468,7 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **The opening story and the first paragraph of "Stranded sibling states" describe one
   operator's observations.** No Esri page states them.
 - **Branch coverage is 100 percent on Windows Python 3.13 and was not measured on Linux.** The
-  figure is 1,420 statements and 368 branches with none missed, from
+  figure is 1,437 statements and 372 branches with none missed, from
   `coverage run --branch compressfloor.py --self-test`.
 - **The fixture's replica ids and `SYNC_` names are copied from Esri's TA 000011719 example.**
   They are public Esri values, not data from any geodatabase.
@@ -1482,8 +1489,24 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **The descendant-version deletion rule comes from the "Delete a traditional version" page
   only.** The Delete Version tool page does not repeat it.
 - **TA 000011719 identifies detached replica versions but does not say whether they hold the
-  compress floor.** Its replica SQL and its warning about other replica system versions were not
-  re-checked in the latest review, because the archived copy was not reachable.
+  compress floor.** Its `SYNC_` name patterns, its replica SQL and its warning
+  about other replica system versions were re-read on 2026-11-11 from the archived copy.
+- **A geodatabase administrator is not the only person who can delete a descendant.** Esri says
+  the version and all its descendant versions are deleted when the person deleting it is the
+  geodatabase administrator or owns the child versions.
+- **The VERDICT states where the floor sits, and the blocker listed above it may not be the
+  version that holds that floor.** With `--max-age-days 400` on the fixture, only the detached
+  replica 48 blocks, but registered replicas 56 and 57 still hold state 17.
+- **A `SYNC_` version at DEFAULT's own state is not listed when a `Sync Replica` item exists.**
+  The same version is listed as a detached blocker when the replicas export has no such item.
+  It holds nothing until DEFAULT's next edit.
+- **The SQL Server replicas query calls `.value()` on `items.Definition` with no `CAST`.** Only
+  synthetic schemas were run, so that column's type in a real geodatabase was not checked.
+- **The deltas SQL builds table names as owner + `.a` + registration id with no quoting.** An
+  owner whose name needs quoting makes step 2 fail with a SQL error, not a wrong answer. The step
+  is a SELECT only.
+- **`delta rows compress cannot fold` also counts delta rows in unreferenced states.** A compress
+  removes those states, so some of that total is removed, not left in place.
 - **Run it as `python3 compressfloor.py`.** The shebang names `python`, which some Linux hosts
   lack. Run directly there, the file exits 127, which a monitor reads as a failure, not a finding.
 - **The unregister plan prints a replica name raw inside `UnregisterReplica(<geodatabase>,

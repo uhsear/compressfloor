@@ -1071,21 +1071,32 @@ def describe(model, report):
     # DEFAULT supports the "will not fold" prediction.
     pins = any(f["blocker"] and f["kind"] != ORPHANED and f["holds"]
                for f in rest)
+    orphans = [f for f in rest if f["blocker"] and f["kind"] == ORPHANED]
+    if any(f["weight"] for f in orphans):
+        orphan_note = (" Orphaned states hold delta rows that a compress "
+                       "removes: extract the rows first.")
+    elif any(f["weight"] is None for f in orphans):
+        orphan_note = (" Orphaned states may hold delta rows, but no delta "
+                       "counts were supplied: export them with --deltas and "
+                       "extract any rows first.")
+    else:
+        orphan_note = ""
     if pins:
         out.append("VERDICT: %d blocker(s). Compress will not fold past "
-                   "state %d." % (blockers, report["floor"]))
+                   "state %d.%s" % (blockers, report["floor"], orphan_note))
     elif blockers and any(f["kind"] != ORPHANED for f in rest
                           if f["blocker"]):
         out.append("VERDICT: %d blocker(s), none of them pins the floor yet. A "
                    "version-held blocker sits at DEFAULT's own state and "
                    "holds nothing until DEFAULT's next edit, and the next "
                    "compress removes orphaned states. %s"
-                   % (blockers, "The replicas export has no rows, so "
-                      "export it again before you delete any version."
-                      if model["replicas"] is not None
-                      and not model["replicas"] else
-                      "Delete the detached replica version(s) the finding "
-                      "names."))
+                   % (blockers, ("The replicas export has no rows, so "
+                                 "export it again before you delete any "
+                                 "version."
+                                 if model["replicas"] is not None
+                                 and not model["replicas"] else
+                                 "Delete the detached replica version(s) the "
+                                 "finding names.") + orphan_note))
     elif blockers and any(f["weight"] for f in rest if f["blocker"]):
         out.append("VERDICT: %d blocker(s), all orphaned states. No blocker "
                    "pins the floor, but some hold delta rows, and a compress "
@@ -1647,6 +1658,40 @@ def self_test():
           "a detached version at DEFAULT's own state is a blocker whose "
           "VERDICT does not predict that compress will not fold  <-- pinned "
           "defect")
+    def verdict_of(model):
+        return [x for x in describe(model, analyse(
+            model, 30, datetime.datetime(2026, 9, 1)))
+            if x.startswith("VERDICT")]
+    young_orphan = dict(tree(
+        [("DEFAULT", "SDE", 5)],
+        [(0, 0, 0, "2026-09-01 00:00:00"), (5, 0, 0, "2026-09-01 00:00:00"),
+         (7, 7, 5, "")], [("SYNC_SEND_4_1", "SDE", 5)], replicas=[]))
+    held = verdict_of(build(**dict(young_orphan, deltas=[
+        {"STATE_ID": "7", "DELTA_ROWS": "40"}])))
+    check(len(held) == 1 and "none of them pins the floor yet" in held[0]
+          and held[0].endswith("Orphaned states hold delta rows that a "
+                               "compress removes: extract the rows first."),
+          "a VERDICT that blames a non-orphan blocker still tells you to "
+          "extract the delta rows of an orphaned blocker first  <-- pinned "
+          "defect")
+    unknown_rows = verdict_of(build(**young_orphan))
+    check(len(unknown_rows) == 1 and unknown_rows[0].endswith(
+        "no delta counts were supplied: export them with --deltas and "
+        "extract any rows first."),
+          "and with no deltas export it says the counts are unknown, never "
+          "that a compress is safe  <-- pinned defect")
+    pinned_unknown = [x for x in describe(
+        build(**dict(fx, deltas=None)),
+        analyse(build(**dict(fx, deltas=None)))) if x.startswith("VERDICT")]
+    check(len(pinned_unknown) == 1 and "will not fold past state 17."
+          in pinned_unknown[0] and "no delta counts were supplied"
+          in pinned_unknown[0],
+          "a VERDICT that predicts the floor also warns about orphaned "
+          "states whose delta rows are unknown  <-- pinned defect")
+    clean_orphan = verdict_of(build(**dict(young_orphan, deltas=[
+        {"STATE_ID": "7", "DELTA_ROWS": "0"}])))
+    check(len(clean_orphan) == 1 and "extract" not in clean_orphan[0],
+          "an orphaned blocker with a counted zero adds no extract warning")
     check(not ry["findings"][0]["holds"] and by[(REPLICA, 56)]["holds"],
           "a finding records whether its fork is below DEFAULT's own state")
     check("nothing in the version table holds the floor" in text
@@ -1949,7 +1994,8 @@ def self_test():
           "a synced replica shows its last log event and generation")
     check("Esri TA 000011719" in joined,
           "a detached version cites the Esri procedure for removing it")
-    check(joined.rstrip().endswith("will not fold past state 17."),
+    check("will not fold past state 17. Orphaned states hold delta rows"
+          in joined.splitlines()[-1],
           "the verdict says compress will not fold past 17 and does not "
           "state an exit status, which no cited page documents")
     check(joined.index("BLOCKERS (5)") < joined.index(
@@ -1981,7 +2027,9 @@ def self_test():
     inj_lines = describe(inj, analyse(inj))
     check(all(line.isprintable() for line in inj_lines)
           and [line for line in inj_lines if line.startswith("VERDICT")]
-          == ["VERDICT: 5 blocker(s). Compress will not fold past state 17."],
+          == ["VERDICT: 5 blocker(s). Compress will not fold past state 17. "
+              "Orphaned states hold delta rows that a compress removes: "
+              "extract the rows first."],
           "a version name holding newlines and an ANSI escape cannot forge a "
           "VERDICT line or hide one  <-- pinned defect")
     inj_text = "\n".join(inj_lines)
@@ -3450,7 +3498,9 @@ DISASTER_REPORT = [
     "      a compress removes states no version needs: if none has ru"
     "n since a version was deleted, run one and export again",
     "",
-    "VERDICT: 5 blocker(s). Compress will not fold past state 17.",
+    "VERDICT: 5 blocker(s). Compress will not fold past state 17. Orphaned"
+    " states hold delta rows that a compress removes: extract the rows"
+    " first.",
 ]
 
 
