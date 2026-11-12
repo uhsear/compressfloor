@@ -265,7 +265,7 @@ The full run prints all 405 assertions. The `...` lines are where this block is 
 - **Esri Technical Article 000011719**, "How To: Determine if there are detached replica system
   versions in the geodatabase". It is the authoritative manual procedure. It names the replica
   system versions, gives the SQL that lists the registered replicas, and tells you to compare the
-  two lists by eye. It is correct, and it covers one of the four things that hold a floor.
+  two lists by eye. It is correct, and it covers one of the three kinds of version that hold a floor.
 - **`StateLineageCheck.py` in [phillegard/ArcGIS_Maintenance](https://github.com/phillegard/ArcGIS_Maintenance)**.
   It counts the rows in the state table through `arcpy` and compares that count with warning and
   critical thresholds. It also prints the lineage row count and an "Orphaned States" count. A
@@ -288,7 +288,7 @@ code, and it is not a claim that no such tool exists.
 
 Neither of the first two says which version or replica holds the floor, and neither runs without a live
 connection. For geodatabase replicas, this tool does the comparison that the article describes.
-It adds the other three holders, and it runs offline against exported rows. For feature service
+It adds the other two kinds of holder, and it runs offline against exported rows. For feature service
 replicas, such as the distributed collaboration replicas in the story, it cannot do that
 comparison. It reports their stuck system versions as unresolved blockers (see the worked
 example).
@@ -1441,8 +1441,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **More mutations change no verdict.** The `if v is default: continue` line in `analyse()` is
   redundant. The `holds_floor` field on stranded findings is never read. The self-test cannot
   see them, and they change no verdict.
-- **Three kinds of version and one kind of unreferenced lineage make up the four findings.**
-  The story counts the versions; `ORPHANED_STATES` is the lineage no version references.
+- **The story counts three kinds of version; the class table lists six classes.**
+  `ORPHANED_STATES` is the lineage no version references, and `STRANDED_SIBLING_STATE` is a state.
+  Neither holds a floor.
 - **The timestamp zone is checked for PostgreSQL only.** `exported_at` comes from the database
   session clock, and `creation_time` is whatever the geodatabase wrote. If a SQL Server or Oracle
   geodatabase stores `creation_time` in another zone than the session clock, every age shifts by
@@ -1533,8 +1534,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
   version name such as `=cmd|' /C calc'!A0` is printed as written, after a fixed label. Open the
   report as text, not in a spreadsheet.
 - **Version, owner and replica names are echoed in several error messages,** for example
-  `versions export row N repeats version OWNER.NAME`. Only text columns are echoed, after
-  unprintable characters are escaped, and never a numeric or time cell. A wrong file that happens
+  `versions export row N repeats version OWNER.NAME`. Text cells are echoed after
+  unprintable characters are escaped. A state id or a time is echoed only after it parsed as a
+  number or a time, and never the value of a cell that could not be read as one. A wrong file that happens
   to carry name and owner columns would print those cells to stderr.
 - **A very large lineages export is slow.** A 10-million-row export (1,000 versions forking from
   a 20,000-state chain) took 55 seconds. The run was correct, so a nightly monitor needs a
