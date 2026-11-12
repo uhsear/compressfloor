@@ -775,7 +775,12 @@ def weight(model, state_ids):
     """
     if model["deltas"] is None or not model["delta_lines"]:
         return None
-    return sum(model["deltas"].get(s, 0) for s in state_ids)
+    total = sum(model["deltas"].get(s, 0) for s in state_ids)
+    if not total and model["delta_tables"] is None:
+        # Without tables_expected the tool cannot see a step 1 line that was
+        # left out, so a zero here is a guess, not a count.
+        return None
+    return total
 
 
 def held_since(model, fork, trunk, as_of):
@@ -1493,7 +1498,8 @@ def self_test():
     check(by[(VERSION, "EDITOR1.OLD_DESIGN")]["weight"] == 5000,
           "a version's own-branch weight counts only states DEFAULT lacks")
     forked = analyse(build(**dict(fx, deltas=fx["deltas"] + [
-        {"STATE_ID": "50", "DELTA_ROWS": "9000"}])))
+        {"STATE_ID": "50", "DELTA_ROWS": "9000",
+         "TABLES_EXPECTED": "2"}])))
     check([f["weight"] for f in forked["findings"]
            if f["key"] == (VERSION, "EDITOR1.OLD_DESIGN")] == [5000],
           "DEFAULT's delta rows at a version's fork state are not counted in "
@@ -1694,9 +1700,17 @@ def self_test():
           "a VERDICT that predicts the floor also warns about orphaned "
           "states whose delta rows are unknown  <-- pinned defect")
     clean_orphan = verdict_of(build(**dict(young_orphan, deltas=[
-        {"STATE_ID": "7", "DELTA_ROWS": "0"}])))
+        {"STATE_ID": "7", "DELTA_ROWS": "0", "TABLES_EXPECTED": "1"},
+        {"STATE_ID": "-1", "DELTA_ROWS": "0", "TABLES_EXPECTED": "1"}])))
     check(len(clean_orphan) == 1 and "extract" not in clean_orphan[0],
           "an orphaned blocker with a counted zero adds no extract warning")
+    bare_orphan = verdict_of(build(**dict(young_orphan, deltas=[
+        {"STATE_ID": "5", "DELTA_ROWS": "3"}])))
+    check(len(bare_orphan) == 1 and "extract any rows first"
+          in bare_orphan[0] and "run one" not in bare_orphan[0],
+          "a deltas export without tables_expected cannot prove an orphaned "
+          "state holds no rows, so it is never told to compress first  "
+          "<-- pinned defect")
     check(not ry["findings"][0]["holds"] and by[(REPLICA, 56)]["holds"],
           "a finding records whether its fork is below DEFAULT's own state")
     check("nothing in the version table holds the floor" in text
@@ -1830,7 +1844,8 @@ def self_test():
           "beside a dated one  <-- pinned defect")
     zero = build(**dict(tree([("DEFAULT", "SDE", 5)], idle + [
         (7, 7, 5, "")], [], None), deltas=[
-            {"STATE_ID": "7", "DELTA_ROWS": "0"}]))
+            {"STATE_ID": "7", "DELTA_ROWS": "0", "TABLES_EXPECTED": "1"},
+            {"STATE_ID": "-1", "DELTA_ROWS": "0", "TABLES_EXPECTED": "1"}]))
     zero_text = "\n".join(describe(zero, analyse(
         zero, 30, datetime.datetime(2026, 9, 1))))
     check("run one and export again" in zero_text
@@ -1872,7 +1887,8 @@ def self_test():
           "an orphaned lineage is aged by its newest state, not its oldest")
 
     check(analyse(build(**dict(fx, deltas=fx["deltas"] + [
-        {"STATE_ID": "17", "DELTA_ROWS": "100"}])))["unfoldable"] == 1809012,
+        {"STATE_ID": "17", "DELTA_ROWS": "100",
+         "TABLES_EXPECTED": "2"}])))["unfoldable"] == 1809012,
           "delta rows on the floor state itself fold, so they are not "
           "counted as unfoldable")
     later = [{"REPLICAID": "1070", "LOGDATE": "2026-09-21 00:00:00",
@@ -3406,12 +3422,10 @@ def fixture():
         {"REPLICAID": "1070", "LOGDATE": "2026-09-19 03:00:00",
          "SOURCEENDGEN": "12", "TARGETGEN": "11"}]
     fx["deltas"] = [
-        {"STATE_ID": "301", "DELTA_ROWS": "1760000"},
-        {"STATE_ID": "60", "DELTA_ROWS": "5000"},
-        {"STATE_ID": "18", "DELTA_ROWS": "0"},
-        {"STATE_ID": "208", "DELTA_ROWS": "44000"},
-        {"STATE_ID": "9000", "DELTA_ROWS": "12"},
-        {"STATE_ID": "10", "DELTA_ROWS": "900"}]
+        {"STATE_ID": s, "DELTA_ROWS": n, "TABLES_EXPECTED": "2"}
+        for s, n in (("301", "1760000"), ("60", "5000"), ("18", "0"),
+                     ("208", "44000"), ("9000", "12"), ("10", "900"),
+                     ("-1", "0"), ("-2", "0"))]
     return fx
 
 

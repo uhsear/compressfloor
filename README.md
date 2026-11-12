@@ -255,10 +255,10 @@ PASS  a run with a failure prints it and exits 1  <-- pinned defect
 PASS  importing the file runs nothing and exposes the core
 PASS  the import probe writes no bytecode beside the script  <-- pinned defect
 --------------------------------------------------------------------
-404 assertions, 0 failed
+405 assertions, 0 failed
 ```
 
-The full run prints all 404 assertions. The `...` lines are where this block is cut.
+The full run prints all 405 assertions. The `...` lines are where this block is cut.
 
 ## What already exists
 
@@ -299,7 +299,7 @@ Python 3.9 or newer and nothing else. No `arcpy`, no database driver, no third-p
 network. You run the SQL yourself, with the client you already use, and give the tool the
 results as CSV or JSON.
 
-The same 404 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
+The same 405 assertions pass everywhere they were run: Windows (Python 3.13.2), Ubuntu 24.04
 (Python 3.12.3) and Windows (Python 3.9.25).
 
 ```
@@ -402,7 +402,9 @@ that compress will not fold: the next compress removes those states. If any of t
 hold delta rows, the VERDICT tells you to extract the rows first, because no page read here
 says that a compress keeps them (see "Stranded sibling states"). Without a `--deltas` export the
 tool cannot tell, so the VERDICT and the finding say that no delta counts were supplied and tell
-you to export them and extract any rows first. Only a counted zero gets the advice to run a compress.
+you to export them and extract any rows first. Only a counted zero gets the advice to run a compress,
+and a zero counts only when the deltas export carries `tables_expected`: without that column the
+tool cannot see a left-out step 1 line, so a state with no line reads as uncounted, never as zero.
 When a non-orphan blocker is also listed, the VERDICT keeps its own sentence about that blocker
 and adds the same extract-first advice for any orphaned blocker that holds, or may hold, delta
 rows. A VERDICT that predicts the floor therefore cannot be read as leave-to-compress when a
@@ -815,7 +817,8 @@ Save each result as a CSV with a header row, or as a JSON array of objects. A SQ
 geodatabase in the `dbo` schema needs `dbo.` in place of `sde.`.
 
 Put each query in its own file, such as `versions.sql`, and run it with the command for your
-client. These are the exact procedures that were tested (see "How the SQL was tested"). Add
+client. These are the exact procedures that were tested for the versions, states, lineages, replicas and
+replica_log queries only (see "How the SQL was tested"). Add
 your own connection options.
 
 | Client | Put at the top of each file | Run | Then |
@@ -1277,8 +1280,10 @@ that has not synced for months holds the floor exactly as hard as a detached one
   `tables_expected` column of the three deltas queries are checked as text in the self-test. The
   PostgreSQL text, with its `::bigint` casts removed, was run on SQLite against a synthetic
   registry, and the three tables gave three markers and `tables_expected` 3. The Docker daemon
-  was not running, so the live PostgreSQL, SQL Server and Oracle runs were not repeated, and
-  the SQL Server and Oracle text of the markers has not run on those engines.
+  was not running then. A later audit ran the PostgreSQL 16.15 deltas step 1 and step 2 live
+  with `psql`, and the report built from that output was byte-identical to the report from the
+  CSV run. The SQL Server and Oracle forms of the deltas, `state_parents` and `version_tree`
+  queries have never run on those engines.
 - **A deltas export that was edited by hand can carry a false proof.** The tool trusts the
   marker rows and `tables_expected` as they are written. Someone who adds a marker row, or
   edits the column, defeats the check. It catches a left-out or repeated step 1 line, not tampering.
@@ -1297,8 +1302,9 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **The fixture's delta count and floor age are rounded stand-ins,** not measurements from any
   real geodatabase.
 - **Whether `UnregisterReplica` accepts the numeric replica id in the export is not
-  verified.** Esri's example passes a GUID, and the plan prints the numeric `<ID>` from the
-  item definition.
+  verified.** The Unregister Replica page says the `in_replica` argument is the name (fully
+  qualified, such as `myuser.myreplica`) or the ID. The numeric-id case rests on that wording
+  alone, and the plan prints a fully-qualified-name warning for it.
 - **The SQL Server and Oracle forms of the `state_parents` and `version_tree` queries have
   not been run.** Only the PostgreSQL forms were.
 - **The recipes need `psql` 12 or newer and SQL\*Plus 12.2 or newer.** `--csv` and
@@ -1308,7 +1314,10 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **A killed `--self-test` leaves its temporary folder behind.** The run removes the
   `compressfloor-*` folder in the temp directory only when it ends normally. Delete leftovers by
   hand.
-- **Timings come from a private generator** and were not reproduced from this repository.
+- **Timings come from a private generator** that is not in this repository. An audit rebuilt a
+  similar export with a different generator (1,500 versions, 11,495 states, 3,445,887 lineage
+  rows), and the run took 16.1 seconds on Windows Python 3.13.2, within about 10 percent of the
+  figure above.
 - **That compress still exits 0 is not sourced.** The story at the top rests on one operator's
   runs. No page in Sources states the exit status of compress. The claim that compress exits 0
   while a version pins it rests on those runs alone.
@@ -1471,7 +1480,7 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **The opening story and the first paragraph of "Stranded sibling states" describe one
   operator's observations.** No Esri page states them.
 - **Branch coverage is 100 percent on Windows Python 3.13 and was not measured on Linux.** The
-  figure is 1,473 statements and 372 branches with none missed, from
+  figure is 1,478 statements and 374 branches with none missed, from
   `coverage run --branch compressfloor.py --self-test`.
 - **The fixture's replica ids and `SYNC_` names are copied from Esri's TA 000011719 example.**
   They are public Esri values, not data from any geodatabase.
@@ -1554,7 +1563,13 @@ that has not synced for months holds the floor exactly as hard as a detached one
 - **Without `--state-parents`, exit 0 says nothing about stranded states.** The stranded view is
   not computed, so states that may hold delta rows are not in the exit code.
 - **A young orphaned lineage is never a blocker.** It can hold delta rows that a compress would
-  remove. Exit 0 does not cover unreferenced rows younger than the age limit.
+  remove. Exit 0 does not cover unreferenced rows younger than the age limit, and it does not
+  mean no unreferenced delta rows exist: read the section "holding state but under the N day
+  limit".
+- **A row cut off inside a numeric field can still parse.** State 9000 cut to 90 reads as state
+  90, and the `row_count` check cannot see it. Export again if a copy was interrupted.
+- **A JSON export that is an empty array cannot prove it was whole.** It has no header and no
+  `row_count`. A header-only CSV carries the `row_count` check.
 - **The unregister plan does not use delta counts.** A version it lists for dropping can hold
   private edits, and the plan gives no warning that dropping it loses them.
 - **A timestamp like `9/20/2026 1:58:10 AM` exits 2.** That is the `Export-Csv` default in
@@ -1564,8 +1579,10 @@ that has not synced for months holds the floor exactly as hard as a detached one
   all files in one short step, when edits are quiet. `--as-of` cannot help: it may not be
   earlier than the newest timestamp either.
 - **A deltas export without a `tables_expected` column is not checked for missing tables.** Only
-  the stranded view refuses such a file. A hand-built file can undercount an orphaned
-  lineage's rows.
+  the stranded view refuses such a file. A hand-built file can undercount the rows of a
+  lineage or version, so the tool reads a total of zero from such a file as uncounted ("not
+  supplied"), and the VERDICT and finding then say no delta counts were supplied, although a
+  file was. A positive total from such a file is a lower bound.
 - **A closed descriptor (`>&-`) leaves no stdout.** The tool exits 2 with a message on stderr
   and prints no report. Use `--report --apply`.
 - **The live Esri page may carry a newer title than the archived copy.** The archived 2021 copy
@@ -1611,7 +1628,8 @@ that has not synced for months holds the floor exactly as hard as a detached one
   cannot synchronize.
 - [Delete a traditional version](https://doc.esri.com/en/arcgis-pro/latest/help/data/geodatabases/overview/delete-a-traditional-version.html)
   and [Delete Version (Data Management)](https://pro.arcgis.com/en/pro-app/latest/tool-reference/data-management/delete-version.htm):
-  a geodatabase administrator who deletes a version deletes its descendant versions too.
+  the first page says that a geodatabase administrator who deletes a version deletes its
+  descendant versions too. The Delete Version tool page says nothing about descendants.
 - [SET QUOTED_IDENTIFIER (Transact-SQL)](https://learn.microsoft.com/en-us/sql/t-sql/statements/set-quoted-identifier-transact-sql):
   the setting must be ON when you invoke `xml` data type methods, and the SQL Server Native
   Client ODBC and OLE DB drivers set it ON when they connect.
